@@ -2281,6 +2281,7 @@ async def generate_messages(
 ##################################
 
 
+from open_webui.routers.openai import completions as openai_completions
 from open_webui.utils.completions import (
     chat_stream_to_completions_stream,
     convert_chat_to_completions_response,
@@ -2289,47 +2290,26 @@ from open_webui.utils.completions import (
 )
 
 
-@app.post('/api/completions')
-@app.post('/api/v1/completions')  # Experimental: Compatibility with OpenAI API
-async def completions(
-    request: Request,
-    form_data: dict,
-    user=Depends(get_verified_user),
+async def _completions_via_chat(
+    request: Request, form_data: dict, user, requested_model: str
 ):
     """
-    OpenAI-compatible legacy (text) completions endpoint.
-
-    Accepts the OpenAI ``/v1/completions`` request format (``prompt``,
-    ``suffix``, ``max_tokens``, ``stream``, ...), converts it internally to the
-    Chat Completions format, routes it through the existing chat completion
-    pipeline, then converts the response back to the legacy ``text_completion``
-    shape.
-
-    This unblocks tools (e.g. continue.dev autocomplete) that require the
-    non-chat ``/completions`` endpoint, which previously returned 405. The
-    ``prompt`` is forwarded verbatim as the user message so callers can supply
-    their own FIM template; when a ``suffix`` is supplied a best-effort
-    fill-in-the-middle framing is used.
-
-    Supports both streaming and non-streaming requests. All models configured
-    in Open WebUI are accessible via this endpoint.
+    Fallback path for providers that do not expose a native ``/completions``
+    route. Converts the legacy payload to Chat Completions, routes it through
+    the standard pipeline and converts the response back to the legacy
+    ``text_completion`` shape. Used for chat-only backends (e.g. Ollama,
+    pipelines) so the endpoint keeps working even without native FIM support.
     """
-    requested_model = form_data.get('model', '')
-
-    # ``echo`` prepends the prompt to the generated text (legacy-only feature).
+    # ``echo`` prepends the prompt to the generated text (legacy-only feature
+    # that chat completions does not implement natively).
     echo_prompt = ''
     if form_data.get('echo'):
         echo_prompt = normalize_completion_prompt(form_data.get('prompt', ''))
 
-    # Convert legacy completions payload to chat completions format
     chat_payload = convert_completions_to_chat_payload(form_data)
-
-    # Route through the existing chat_completion handler
     response = await chat_completion(request, chat_payload, user)
 
-    # Convert the response back to the legacy completions format
     if isinstance(response, StreamingResponse):
-        # Streaming response: wrap the generator to convert SSE format
         return StreamingResponse(
             chat_stream_to_completions_stream(
                 response.body_iterator,
@@ -2349,6 +2329,53 @@ async def completions(
     else:
         # Passthrough for error responses (JSONResponse, PlainTextResponse, etc.)
         return response
+
+
+@app.post('/api/completions')
+@app.post('/api/v1/completions')  # Experimental: Compatibility with OpenAI API
+async def completions(
+    request: Request,
+    form_data: dict,
+    user=Depends(get_verified_user),
+):
+    """
+    OpenAI-compatible legacy (text) completions endpoint.
+
+    Accepts the OpenAI ``/v1/completions`` request format (``prompt``,
+    ``suffix``, ``max_tokens``, ``stream``, ``echo``, ...). The payload is
+    proxied verbatim to the upstream provider's native ``/completions``
+    endpoint (e.g. a local vLLM server), preserving fill-in-the-middle (FIM)
+    behavior that IDE autocomplete extensions such as continue.dev rely on.
+    Callers authenticate with their Open WebUI API key; model access control
+    and backend routing mirror ``/api/chat/completions``.
+
+    Providers without a native ``/completions`` route (e.g. Ollama, pipelines,
+    chat-only APIs) return ``404``/``405``; in that case the request falls back
+    to a Chat Completions conversion so the endpoint still works. Both
+    streaming and non-streaming requests are supported.
+    """
+    requested_model = form_data.get('model', '')
+
+    # Primary path: proxy verbatim to the provider's native /completions route.
+    needs_fallback = False
+    try:
+        response = await openai_completions(request, form_data, user)
+        if hasattr(response, 'status_code') and response.status_code in (404, 405):
+            needs_fallback = True
+    except HTTPException as e:
+        # 404 (no matching OpenAI model / route) or 405 means the backend can't
+        # serve legacy completions directly — fall back to chat conversion.
+        # Access-control denials (401/403) and other errors propagate as-is.
+        if e.status_code in (404, 405):
+            needs_fallback = True
+        else:
+            raise
+
+    if needs_fallback:
+        return await _completions_via_chat(request, form_data, user, requested_model)
+
+    # Native response is already in the legacy text_completion shape.
+    return response
 
 
 @app.post('/api/chat/completed')
