@@ -2274,6 +2274,110 @@ async def generate_messages(
         return response
 
 
+##################################
+#
+# OpenAI Legacy Completions Compatible Endpoint
+#
+##################################
+
+
+from open_webui.routers.openai import completions as openai_completions
+from open_webui.utils.completions import (
+    chat_stream_to_completions_stream,
+    convert_chat_to_completions_response,
+    convert_completions_to_chat_payload,
+    normalize_completion_prompt,
+)
+
+
+async def _completions_via_chat(
+    request: Request, form_data: dict, user, requested_model: str
+):
+    """
+    Fallback path for providers that do not expose a native ``/completions``
+    route. Converts the legacy payload to Chat Completions, routes it through
+    the standard pipeline and converts the response back to the legacy
+    ``text_completion`` shape. Used for chat-only backends (e.g. Ollama,
+    pipelines) so the endpoint keeps working even without native FIM support.
+    """
+    # ``echo`` prepends the prompt to the generated text (legacy-only feature
+    # that chat completions does not implement natively).
+    echo_prompt = ''
+    if form_data.get('echo'):
+        echo_prompt = normalize_completion_prompt(form_data.get('prompt', ''))
+
+    chat_payload = convert_completions_to_chat_payload(form_data)
+    response = await chat_completion(request, chat_payload, user)
+
+    if isinstance(response, StreamingResponse):
+        return StreamingResponse(
+            chat_stream_to_completions_stream(
+                response.body_iterator,
+                model=requested_model,
+                echo_prompt=echo_prompt,
+            ),
+            media_type='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+            },
+        )
+    elif isinstance(response, dict):
+        return convert_chat_to_completions_response(
+            response, model=requested_model, echo_prompt=echo_prompt
+        )
+    else:
+        # Passthrough for error responses (JSONResponse, PlainTextResponse, etc.)
+        return response
+
+
+@app.post('/api/completions')
+@app.post('/api/v1/completions')  # Experimental: Compatibility with OpenAI API
+async def completions(
+    request: Request,
+    form_data: dict,
+    user=Depends(get_verified_user),
+):
+    """
+    OpenAI-compatible legacy (text) completions endpoint.
+
+    Accepts the OpenAI ``/v1/completions`` request format (``prompt``,
+    ``suffix``, ``max_tokens``, ``stream``, ``echo``, ...). The payload is
+    proxied verbatim to the upstream provider's native ``/completions``
+    endpoint (e.g. a local vLLM server), preserving fill-in-the-middle (FIM)
+    behavior that IDE autocomplete extensions such as continue.dev rely on.
+    Callers authenticate with their Open WebUI API key; model access control
+    and backend routing mirror ``/api/chat/completions``.
+
+    Providers without a native ``/completions`` route (e.g. Ollama, pipelines,
+    chat-only APIs) return ``404``/``405``; in that case the request falls back
+    to a Chat Completions conversion so the endpoint still works. Both
+    streaming and non-streaming requests are supported.
+    """
+    requested_model = form_data.get('model', '')
+
+    # Primary path: proxy verbatim to the provider's native /completions route.
+    needs_fallback = False
+    try:
+        response = await openai_completions(request, form_data, user)
+        if hasattr(response, 'status_code') and response.status_code in (404, 405):
+            needs_fallback = True
+    except HTTPException as e:
+        # 404 (no matching OpenAI model / route) or 405 means the backend can't
+        # serve legacy completions directly — fall back to chat conversion.
+        # Access-control denials (401/403) and other errors propagate as-is.
+        if e.status_code in (404, 405):
+            needs_fallback = True
+        else:
+            raise
+
+    if needs_fallback:
+        return await _completions_via_chat(request, form_data, user, requested_model)
+
+    # Native response is already in the legacy text_completion shape.
+    return response
+
+
 @app.post('/api/chat/completed')
 async def chat_completed(request: Request, form_data: dict, user=Depends(get_verified_user)):
     """Deprecated: outlet filters now run inline during chat completion.

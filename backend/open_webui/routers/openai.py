@@ -1278,6 +1278,162 @@ async def generate_chat_completion(
             await cleanup_response(r)
 
 
+async def completions(
+    request: Request,
+    form_data: dict,
+    user,
+    bypass_filter: bool = False,
+):
+    """
+    Calls the legacy (text) ``/completions`` endpoint for OpenAI-compatible
+    providers such as vLLM, llama.cpp or LM Studio.
+
+    The request body (``prompt``, ``suffix``, ``max_tokens``, ``stream``,
+    ``echo``, ``logprobs``, ...) is forwarded verbatim to the upstream provider
+    so backends that natively support fill-in-the-middle (FIM) keep that
+    capability — this is what IDE autocomplete extensions such as continue.dev
+    rely on. Model routing, API key injection and access control mirror
+    :func:`generate_chat_completion`, so callers authenticate with their Open
+    WebUI API key and the upstream provider key never leaves the server.
+
+    Returns the upstream response unchanged: a ``dict`` for non-streaming
+    requests, a :class:`StreamingResponse` for SSE, or a ``JSONResponse`` /
+    ``PlainTextResponse`` carrying the upstream error status. Providers that do
+    not expose a ``/completions`` route surface as a ``404``/``405`` response,
+    which the public ``/api/completions`` handler uses to fall back to a chat
+    completions conversion.
+    """
+    if BYPASS_MODEL_ACCESS_CONTROL:
+        bypass_filter = True
+
+    payload = {**form_data}
+    metadata = payload.pop('metadata', None)
+
+    model_id = form_data.get('model')
+    model_info = await Models.get_model_by_id(model_id)
+
+    # Resolve Open WebUI model config (base model, params) and enforce access.
+    if model_info:
+        if model_info.base_model_id:
+            payload['model'] = model_info.base_model_id
+            model_id = model_info.base_model_id
+
+        params = model_info.params.model_dump()
+        if params:
+            # Legacy completions has no system prompt / messages to apply it to.
+            params.pop('system', None)
+            payload = apply_model_params_to_body_openai(params, payload)
+
+        await check_model_access(user, model_info, bypass_filter)
+    else:
+        await check_model_access(user, None, bypass_filter)
+
+    # Find the correct backend url/key based on the (base) model.
+    models = request.app.state.OPENAI_MODELS
+    if not models or model_id not in models:
+        await get_all_models(request, user=user)
+        models = request.app.state.OPENAI_MODELS
+    model = models.get(model_id)
+
+    if model:
+        idx = model['urlIdx']
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
+        )
+
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
+        str(idx),
+        request.app.state.config.OPENAI_API_CONFIGS.get(
+            request.app.state.config.OPENAI_API_BASE_URLS[idx], {}
+        ),  # Legacy support
+    )
+
+    prefix_id = api_config.get('prefix_id', None)
+    if prefix_id and isinstance(payload.get('model'), str):
+        payload['model'] = payload['model'].replace(f'{prefix_id}.', '')
+
+    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+    key = request.app.state.config.OPENAI_API_KEYS[idx]
+
+    body = json.dumps(payload)
+
+    r = None
+    streaming = False
+
+    headers, cookies = await get_headers_and_cookies(request, url, key, api_config, metadata, user=user)
+
+    if api_config.get('azure') or api_config.get('provider') == 'azure':
+        # Only set api-key header if not using Azure Entra ID authentication
+        auth_type = api_config.get('auth_type', 'bearer')
+        if auth_type not in ('azure_ad', 'microsoft_entra_id'):
+            headers['api-key'] = key
+
+        is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
+        if is_azure_v1:
+            completions_url = f'{url.rstrip("/")}/completions'
+        else:
+            api_version = api_config.get('api_version', '2023-03-15-preview')
+            model_name = _sanitize_model_for_url(payload.get('model', ''))
+            completions_url = f'{url}/openai/deployments/{model_name}/completions?api-version={api_version}'
+            headers['api-version'] = api_version
+    else:
+        completions_url = f'{url}/completions'
+
+    try:
+        session = await get_session()
+        r = await session.request(
+            method='POST',
+            url=completions_url,
+            data=body,
+            headers=headers,
+            cookies=cookies,
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+        )
+
+        if 'text/event-stream' in r.headers.get('Content-Type', ''):
+            if r.status >= 400:
+                error_body = await r.text()
+                try:
+                    return JSONResponse(status_code=r.status, content=json.loads(error_body))
+                except json.JSONDecodeError:
+                    return JSONResponse(
+                        status_code=r.status,
+                        content={'error': {'message': error_body, 'code': r.status}},
+                    )
+
+            streaming = True
+            return StreamingResponse(
+                stream_wrapper(r),
+                status_code=r.status,
+                headers=_clean_proxy_headers(r.headers),
+            )
+        else:
+            try:
+                response_data = await r.json()
+            except Exception:
+                response_data = await r.text()
+
+            if r.status >= 400:
+                if isinstance(response_data, (dict, list)):
+                    return JSONResponse(status_code=r.status, content=response_data)
+                else:
+                    return PlainTextResponse(status_code=r.status, content=response_data)
+
+            return response_data
+    except Exception as e:
+        log.exception(e)
+        raise HTTPException(
+            status_code=r.status if r else 500,
+            detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR,
+        )
+    finally:
+        if not streaming:
+            await cleanup_response(r)
+
+
 async def embeddings(request: Request, form_data: dict, user):
     """
     Calls the embeddings endpoint for OpenAI-compatible providers.
