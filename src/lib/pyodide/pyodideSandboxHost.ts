@@ -17,7 +17,7 @@ const sandboxScript = String.raw`
 		stdout = null;
 		stderr = null;
 		pyodide = await loadPyodide({
-			indexURL: '/pyodide/',
+			indexURL: self.__PYODIDE_INDEX_URL__ || '/pyodide/',
 			stdout: function (text) {
 				stdout = stdout ? stdout + text + '\n' : text + '\n';
 			},
@@ -116,13 +116,14 @@ const sandboxScript = String.raw`
 			'_old_show = matplotlib.pyplot.show',
 			'assert _old_show, "matplotlib.pyplot.show"',
 			'def show(*, block=None):',
-			'\\tbuf = BytesIO()',
-			'\\tmatplotlib.pyplot.savefig(buf, format="png")',
-			'\\tbuf.seek(0)',
-			'\\timg_str = base64.b64encode(buf.read()).decode("utf-8")',
-			'\\tmatplotlib.pyplot.clf()',
-			'\\tbuf.close()',
-			'\\tprint(f"data:image/png;base64,{img_str}")',
+			// String.raw keeps \t as-is; the sandbox's JS parser turns it into a real tab
+			'\tbuf = BytesIO()',
+			'\tmatplotlib.pyplot.savefig(buf, format="png")',
+			'\tbuf.seek(0)',
+			'\timg_str = base64.b64encode(buf.read()).decode("utf-8")',
+			'\tmatplotlib.pyplot.clf()',
+			'\tbuf.close()',
+			'\tprint(f"data:image/png;base64,{img_str}")',
 			'matplotlib.pyplot.show = show'
 		].join('\n'));
 	}
@@ -145,45 +146,52 @@ const sandboxScript = String.raw`
 		if (event.source !== parent) return;
 		const data = event.data || {};
 		const id = data.id;
-		if (!data.type || data.type === 'execute') {
-			await ensureRuntime(data.packages || []);
-			await execute(id, data.code, data.files);
-			return;
-		}
-		await ensureRuntime();
-		switch (data.type) {
-			case 'fs:upload':
-				upload(data.files, data.dir);
-				post({ id: id, type: data.type, success: true });
-				break;
-			case 'fs:list':
-				post({ id: id, type: data.type, entries: list(data.path) });
-				break;
-			case 'fs:read':
-				try {
-					const buffer = pyodide.FS.readFile(data.path).buffer;
-					post({ id: id, type: data.type, data: buffer }, [buffer]);
-				} catch (error) {
-					post({ id: id, type: data.type, error: error && error.message ? error.message : String(error) });
-				}
-				break;
-			case 'fs:delete':
-				remove(data.path);
-				post({ id: id, type: data.type, success: true });
-				break;
-			case 'fs:mkdir':
-				pyodide.FS.mkdirTree(data.path);
-				post({ id: id, type: data.type, success: true });
-				break;
-			case 'fs:sync':
-				post({ id: id, type: data.type, success: true });
-				break;
+		try {
+			if (!data.type || data.type === 'execute') {
+				await ensureRuntime(data.packages || []);
+				await execute(id, data.code, data.files);
+				return;
+			}
+			await ensureRuntime();
+			switch (data.type) {
+				case 'fs:upload':
+					upload(data.files, data.dir);
+					post({ id: id, type: data.type, success: true });
+					break;
+				case 'fs:list':
+					post({ id: id, type: data.type, entries: list(data.path) });
+					break;
+				case 'fs:read':
+					try {
+						const buffer = pyodide.FS.readFile(data.path).buffer;
+						post({ id: id, type: data.type, data: buffer }, [buffer]);
+					} catch (error) {
+						post({ id: id, type: data.type, error: error && error.message ? error.message : String(error) });
+					}
+					break;
+				case 'fs:delete':
+					remove(data.path);
+					post({ id: id, type: data.type, success: true });
+					break;
+				case 'fs:mkdir':
+					pyodide.FS.mkdirTree(data.path);
+					post({ id: id, type: data.type, success: true });
+					break;
+				case 'fs:sync':
+					post({ id: id, type: data.type, success: true });
+					break;
+			}
+		} catch (error) {
+			post({ id: id, stderr: error && error.message ? error.message : String(error) });
 		}
 	});
 })();
 `;
 
-const sandboxHtml = `<!doctype html><html><head><meta charset="utf-8"></head><body><script src="/pyodide/pyodide.js"></script><script>${sandboxScript}</script></body></html>`;
+// indexURL must be absolute because about:srcdoc can't be a base URL
+const pyodideIndexURL = `${globalThis.location?.origin ?? ''}/pyodide/`;
+
+const sandboxHtml = `<!doctype html><html><head><meta charset="utf-8"><script>window.__PYODIDE_INDEX_URL__=${JSON.stringify(pyodideIndexURL)}</script></head><body><script src="${pyodideIndexURL}pyodide.js"></script><script>${sandboxScript}</script></body></html>`;
 
 export class PyodideSandboxHost {
 	onmessage: MessageListener | null = null;

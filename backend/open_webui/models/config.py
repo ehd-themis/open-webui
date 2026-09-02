@@ -14,6 +14,7 @@ import logging
 import time
 from typing import Any, ClassVar
 
+from fastapi.encoders import jsonable_encoder
 from open_webui.internal.db import Base, get_async_db
 from sqlalchemy import JSON, BigInteger, Column, Text, delete, select
 
@@ -31,6 +32,8 @@ DICT_CONFIG_KEY_ALIASES = {
     'audio.tts.openai.params': ('AUDIO_TTS_OPENAI_PARAMS',),
     'models.default_metadata': ('DEFAULT_MODEL_METADATA',),
     'models.default_params': ('DEFAULT_MODEL_PARAMS',),
+    'task.model.params': ('TASK_MODEL_PARAMS',),
+    'ui.default_interface_settings': ('DEFAULT_INTERFACE_SETTINGS',),
     'user.permissions': ('USER_PERMISSIONS',),
 }
 DICT_CONFIG_KEYS = tuple(DICT_CONFIG_KEY_ALIASES)
@@ -45,8 +48,10 @@ API_CONFIG_FIELDS = (
     'auth_type',
     'headers',
     'azure',
+    'api_type',
     'api_version',
     'extra_params',
+    'passthrough_params',
 )
 
 
@@ -86,6 +91,10 @@ def _assign_path(target: dict, path: list[str], value: Any) -> None:
     current[path[-1]] = value
 
 
+def _json_value(value: Any) -> Any:
+    return jsonable_encoder(value)
+
+
 # ── Model ────────────────────────────────────────────────────────────────────
 
 
@@ -112,7 +121,7 @@ class Config(Base):
         enable_persistent: bool = True,
         enable_oauth_persistent: bool = False,
     ) -> None:
-        cls.DEFAULTS = defaults or {}
+        cls.DEFAULTS = dict(defaults or {})
         cls.PERSISTENT_ENABLED = enable_persistent
         cls.OAUTH_PERSISTENT_ENABLED = enable_oauth_persistent
 
@@ -188,9 +197,20 @@ class Config(Base):
     @staticmethod
     async def upsert(updates: dict) -> None:
         """Upsert multiple config key-value pairs. Raises on failure."""
+        persistent_updates = {}
+        for key, value in updates.items():
+            value = _json_value(value)
+            if Config.persistent_enabled_for(key):
+                persistent_updates[key] = value
+            else:
+                Config.DEFAULTS[key] = value
+
+        if not persistent_updates:
+            return
+
         async with get_async_db() as db:
             now = int(time.time())
-            for key, value in updates.items():
+            for key, value in persistent_updates.items():
                 existing = await db.get(Config, key)
                 if existing:
                     existing.value = value
@@ -231,7 +251,12 @@ class Config(Base):
             now = int(time.time())
             new_count = 0
             for key, value in defaults.items():
+                # Skip keys the DB is not authoritative for (e.g. oauth.* while
+                # ENABLE_OAUTH_PERSISTENT_CONFIG is off), matching the read paths.
+                if not Config.persistent_enabled_for(key):
+                    continue
                 if key not in existing_keys:
+                    value = _json_value(value)
                     db.add(Config(key=key, value=value, updated_at=now))
                     existing_keys.add(key)
                     new_count += 1
@@ -275,14 +300,16 @@ class Config(Base):
             )
 
     @staticmethod
-    async def repair_flattened_dict_configs() -> None:
-        """Reassemble dict config values flattened by the per-key migration."""
+    async def repair_config_rows() -> None:
+        """Repair known legacy config row shapes."""
         if not Config.PERSISTENT_ENABLED:
             return
 
         async with get_async_db() as db:
             repaired_keys: list[str] = []
             orphan_keys: list[str] = []
+            default_model_keys: list[str] = []
+            now = int(time.time())
 
             for config_key, aliases in DICT_CONFIG_KEY_ALIASES.items():
                 prefixes = (config_key, *aliases)
@@ -330,14 +357,26 @@ class Config(Base):
 
                 if existing:
                     existing.value = repaired
-                    existing.updated_at = int(time.time())
+                    existing.updated_at = now
                 else:
-                    db.add(Config(key=config_key, value=repaired, updated_at=int(time.time())))
+                    db.add(Config(key=config_key, value=repaired, updated_at=now))
                 repaired_keys.append(config_key)
 
             if orphan_keys:
                 await db.execute(delete(Config).where(Config.key.in_(orphan_keys)))
 
-            if repaired_keys or orphan_keys:
+            for key in ('ui.default_models', 'ui.default_pinned_models'):
+                row = await db.get(Config, key)
+                if not row or not isinstance(row.value, list):
+                    continue
+
+                row.value = ','.join(model_id for model_id in (str(item).strip() for item in row.value) if model_id)
+                row.updated_at = now
+                default_model_keys.append(key)
+
+            if repaired_keys or orphan_keys or default_model_keys:
                 await db.commit()
-                log.info('Repaired flattened dict config rows for %s', ', '.join(repaired_keys))
+                if repaired_keys or orphan_keys:
+                    log.info('Repaired flattened dict config rows for %s', ', '.join(repaired_keys))
+                if default_model_keys:
+                    log.info('Repaired default model config rows for %s', ', '.join(default_model_keys))

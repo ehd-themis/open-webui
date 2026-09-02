@@ -2,7 +2,6 @@
 	import Fuse from 'fuse.js';
 	import { toast } from 'svelte-sonner';
 	import { v4 as uuidv4 } from 'uuid';
-	import { PaneGroup, Pane, PaneResizer } from 'paneforge';
 
 	import { onMount, getContext, onDestroy, tick } from 'svelte';
 	import type { Writable } from 'svelte/store';
@@ -46,9 +45,10 @@
 		syncKnowledgeCleanup,
 		testExternalKnowledgeRetrieval
 	} from '$lib/apis/knowledge';
-	import { processWeb, processYoutubeVideo } from '$lib/apis/retrieval';
+	import { processUrl } from '$lib/apis/retrieval';
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
-	import { blobToFile, isYoutubeUrl, copyToClipboard } from '$lib/utils';
+	import { blobToFile, copyToClipboard } from '$lib/utils';
 	import { computeFileHash } from '$lib/utils/hash';
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
@@ -65,21 +65,17 @@
 	import ConfirmDialog from '../../common/ConfirmDialog.svelte';
 	import Drawer from '$lib/components/common/Drawer.svelte';
 	import ChevronLeft from '$lib/components/icons/ChevronLeft.svelte';
-	import LockClosed from '$lib/components/icons/LockClosed.svelte';
+	import AccessButton from '$lib/components/common/AccessButton.svelte';
 	import AccessControlModal from '../common/AccessControlModal.svelte';
 	import Search from '$lib/components/icons/Search.svelte';
 	import FilesOverlay from '$lib/components/chat/MessageInput/FilesOverlay.svelte';
 	import DropdownOptions from '$lib/components/common/DropdownOptions.svelte';
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
+	import DropdownMenu from '$lib/components/common/DropdownMenu.svelte';
 	import Checkbox from '$lib/components/common/Checkbox.svelte';
 	import AdjustmentsHorizontal from '$lib/components/icons/AdjustmentsHorizontal.svelte';
 	import Pagination from '$lib/components/common/Pagination.svelte';
 	import AttachWebpageModal from '$lib/components/chat/MessageInput/AttachWebpageModal.svelte';
-
-	let largeScreen = true;
-
-	let pane;
-	let showSidepanel = true;
 
 	let showAddWebpageModal = false;
 	let showAddTextContentModal = false;
@@ -91,7 +87,9 @@
 	let showAccessControlModal = false;
 	let showResetConfirm = false;
 
-	let minSize = 0;
+	type DirectoryFileEntry = { path: string; filename: string; file: File };
+	type DirectoryManifestEntry = DirectoryFileEntry & { checksum: string; size: number };
+
 	type Knowledge = {
 		id: string;
 		name: string;
@@ -303,6 +301,11 @@
 	};
 
 	const uploadWeb = async (urls) => {
+		if (!knowledge) {
+			toast.error($i18n.t('Knowledge base not found.'));
+			return;
+		}
+
 		if (!Array.isArray(urls)) {
 			urls = [urls];
 		}
@@ -325,29 +328,47 @@
 		for (const fileItem of newFileItems) {
 			try {
 				console.log(fileItem);
-				const res = await processWeb(localStorage.token, '', fileItem.url, false).catch((e) => {
-					console.error('Error processing web URL:', e);
+				const res = await processUrl(localStorage.token, fileItem.url).catch((e) => {
+					console.error('Error processing URL:', e);
 					return null;
 				});
 
 				if (res) {
 					console.log(res);
-					const file = createFileFromText(
-						// Use URL as filename, sanitized
-						fileItem.url
-							.replace(/[^a-z0-9]/gi, '_')
-							.toLowerCase()
-							.slice(0, 50),
-						res.content
-					);
+					let uploadedFile = res.file;
 
-					const uploadedFile = await uploadFile(localStorage.token, file, {
-						knowledge_id: knowledge.id,
-						directory_id: currentDirectoryId
-					}).catch((e) => {
-						toast.error(`${e}`);
-						return null;
-					});
+					if (res.type === 'web' || res.type === 'youtube') {
+						const file = createFileFromText(
+							// Use URL as filename, sanitized
+							fileItem.url
+								.replace(/[^a-z0-9]/gi, '_')
+								.toLowerCase()
+								.slice(0, 50),
+							res.content ?? ''
+						);
+
+						uploadedFile = await uploadFile(localStorage.token, file, {
+							knowledge_id: knowledge.id,
+							directory_id: currentDirectoryId,
+							source_url: fileItem.url
+						}).catch((e) => {
+							toast.error(`${e}`);
+							return null;
+						});
+					} else if (uploadedFile?.id) {
+						const linkedKnowledge = await addFileToKnowledgeById(
+							localStorage.token,
+							knowledge.id,
+							uploadedFile.id,
+							currentDirectoryId
+						).catch((e) => {
+							toast.error(`${e}`);
+							return null;
+						});
+						if (!linkedKnowledge) {
+							uploadedFile = null;
+						}
+					}
 
 					if (uploadedFile) {
 						console.log(uploadedFile);
@@ -463,165 +484,15 @@
 	};
 
 	const uploadDirectoryHandler = async () => {
-		// Check if File System Access API is supported
-		const isFileSystemAccessSupported = 'showDirectoryPicker' in window;
-
-		try {
-			if (isFileSystemAccessSupported) {
-				// Modern browsers (Chrome, Edge) implementation
-				await handleModernBrowserUpload();
-			} else {
-				// Firefox fallback
-				await handleFirefoxUpload();
-			}
-		} catch (error) {
-			handleUploadError(error);
+		const entries = await collectDirectoryFiles();
+		if (entries?.length) {
+			await uploadDirectoryEntries(entries);
 		}
 	};
 
 	// Helper function to check if a path contains hidden folders
 	const hasHiddenFolder = (path) => {
 		return path.split('/').some((part) => part.startsWith('.'));
-	};
-
-	// Modern browsers implementation using File System Access API
-	const handleModernBrowserUpload = async () => {
-		const dirHandle = await window.showDirectoryPicker();
-		let totalFiles = 0;
-		let uploadedFiles = 0;
-
-		// Function to update the UI with the progress
-		const updateProgress = () => {
-			const percentage = (uploadedFiles / totalFiles) * 100;
-			toast.info(
-				$i18n.t('Upload Progress: {{uploadedFiles}}/{{totalFiles}} ({{percentage}}%)', {
-					uploadedFiles: uploadedFiles,
-					totalFiles: totalFiles,
-					percentage: percentage.toFixed(2)
-				})
-			);
-		};
-
-		// Recursive function to count all files excluding hidden ones
-		async function countFiles(dirHandle) {
-			for await (const entry of dirHandle.values()) {
-				// Skip hidden files and directories
-				if (entry.name.startsWith('.')) continue;
-
-				if (entry.kind === 'file') {
-					totalFiles++;
-				} else if (entry.kind === 'directory') {
-					// Only process non-hidden directories
-					if (!entry.name.startsWith('.')) {
-						await countFiles(entry);
-					}
-				}
-			}
-		}
-
-		// Recursive function to process directories excluding hidden files and folders
-		async function processDirectory(dirHandle, path = '') {
-			for await (const entry of dirHandle.values()) {
-				// Skip hidden files and directories
-				if (entry.name.startsWith('.')) continue;
-
-				const entryPath = path ? `${path}/${entry.name}` : entry.name;
-
-				// Skip if the path contains any hidden folders
-				if (hasHiddenFolder(entryPath)) continue;
-
-				if (entry.kind === 'file') {
-					const file = await entry.getFile();
-					const fileWithPath = new File([file], entryPath, { type: file.type });
-
-					await uploadFileHandler(fileWithPath);
-					uploadedFiles++;
-					updateProgress();
-				} else if (entry.kind === 'directory') {
-					// Only process non-hidden directories
-					if (!entry.name.startsWith('.')) {
-						await processDirectory(entry, entryPath);
-					}
-				}
-			}
-		}
-
-		await countFiles(dirHandle);
-		updateProgress();
-
-		if (totalFiles > 0) {
-			await processDirectory(dirHandle);
-		} else {
-			console.log('No files to upload.');
-		}
-	};
-
-	// Firefox fallback implementation using traditional file input
-	const handleFirefoxUpload = async () => {
-		return new Promise((resolve, reject) => {
-			// Create hidden file input
-			const input = document.createElement('input');
-			input.type = 'file';
-			input.webkitdirectory = true;
-			input.directory = true;
-			input.multiple = true;
-			input.style.display = 'none';
-
-			// Add input to DOM temporarily
-			document.body.appendChild(input);
-
-			input.onchange = async () => {
-				try {
-					const files = Array.from(input.files)
-						// Filter out files from hidden folders
-						.filter((file) => !hasHiddenFolder(file.webkitRelativePath));
-
-					let totalFiles = files.length;
-					let uploadedFiles = 0;
-
-					// Function to update the UI with the progress
-					const updateProgress = () => {
-						const percentage = (uploadedFiles / totalFiles) * 100;
-						toast.info(
-							$i18n.t('Upload Progress: {{uploadedFiles}}/{{totalFiles}} ({{percentage}}%)', {
-								uploadedFiles: uploadedFiles,
-								totalFiles: totalFiles,
-								percentage: percentage.toFixed(2)
-							})
-						);
-					};
-
-					updateProgress();
-
-					// Process all files
-					for (const file of files) {
-						// Skip hidden files (additional check)
-						if (!file.name.startsWith('.')) {
-							const relativePath = file.webkitRelativePath || file.name;
-							const fileWithPath = new File([file], relativePath, { type: file.type });
-
-							await uploadFileHandler(fileWithPath);
-							uploadedFiles++;
-							updateProgress();
-						}
-					}
-
-					// Clean up
-					document.body.removeChild(input);
-					resolve();
-				} catch (error) {
-					reject(error);
-				}
-			};
-
-			input.onerror = (error) => {
-				document.body.removeChild(input);
-				reject(error);
-			};
-
-			// Trigger file picker
-			input.click();
-		});
 	};
 
 	// Error handler
@@ -634,18 +505,14 @@
 		}
 	};
 
-	// Collect files from a directory without uploading — returns {path, filename, file}[]
-	const collectDirectoryFiles = async (): Promise<Array<{
-		path: string;
-		filename: string;
-		file: File;
-	}> | null> => {
+	// Collect files from a directory without uploading.
+	const collectDirectoryFiles = async (): Promise<DirectoryFileEntry[] | null> => {
 		const isFileSystemAccessSupported = 'showDirectoryPicker' in window;
 
 		try {
 			if (isFileSystemAccessSupported) {
 				const dirHandle = await window.showDirectoryPicker();
-				const collected: Array<{ path: string; filename: string; file: File }> = [];
+				const collected: DirectoryFileEntry[] = [];
 
 				async function traverse(handle: FileSystemDirectoryHandle, dirPath = '') {
 					for await (const entry of handle.values()) {
@@ -662,7 +529,7 @@
 					}
 				}
 
-				await traverse(dirHandle);
+				await traverse(dirHandle, dirHandle.name);
 				return collected;
 			} else {
 				// Firefox fallback
@@ -683,10 +550,8 @@
 
 							const collected = files.map((file) => {
 								const parts = file.webkitRelativePath.split('/');
-								// Remove root dir name, extract path and filename
-								const withoutRoot = parts.slice(1);
-								const filename = withoutRoot.pop() || file.name;
-								const path = withoutRoot.join('/');
+								const filename = parts.pop() || file.name;
+								const path = parts.join('/');
 								return { path, filename, file };
 							});
 
@@ -712,6 +577,135 @@
 		}
 	};
 
+	const buildDirectoryManifest = async (
+		entries: DirectoryFileEntry[]
+	): Promise<DirectoryManifestEntry[]> => {
+		return Promise.all(
+			entries.map(async (entry) => ({
+				...entry,
+				checksum: await computeFileHash(entry.file),
+				size: entry.file.size
+			}))
+		);
+	};
+
+	const createMissingDirectories = async (diff: any) => {
+		if (!knowledge) return {};
+
+		const directoryIdByPath: Record<string, string> = { ...(diff.directory_map || {}) };
+
+		for (const dirPath of diff.mkdir) {
+			const segments = dirPath.split('/');
+			const name = segments.at(-1)!;
+			const parentPath = segments.slice(0, -1).join('/');
+			const parentId = parentPath ? directoryIdByPath[parentPath] : null;
+
+			const directory = await createKnowledgeDirectory(
+				localStorage.token,
+				knowledge.id,
+				name,
+				parentId
+			);
+			if (directory) {
+				directoryIdByPath[dirPath] = directory.id;
+			}
+		}
+
+		return directoryIdByPath;
+	};
+
+	const getDirectoryUploadPath = (path: string) => {
+		const currentPath = breadcrumbs.map((crumb) => crumb.name).join('/');
+		return currentPath && path ? `${currentPath}/${path}` : currentPath || path;
+	};
+
+	const uploadManifestEntries = async (
+		entries: DirectoryManifestEntry[],
+		resolveDirectoryId: (entry: DirectoryManifestEntry) => string | null | undefined
+	) => {
+		let failedCount = 0;
+
+		for (const [index, entry] of entries.entries()) {
+			const displayPath = entry.path ? `${entry.path}/${entry.filename}` : entry.filename;
+			syncing = $i18n.t('Uploading {{current}}/{{total}}: {{file}}', {
+				current: index + 1,
+				total: entries.length,
+				file: displayPath
+			});
+
+			const fileObject = new File([entry.file], entry.filename, { type: entry.file.type });
+			const uploadedFile = await uploadFile(localStorage.token, fileObject, {
+				knowledge_id: knowledge.id,
+				file_hash: entry.checksum,
+				directory_id: resolveDirectoryId(entry)
+			}).catch((error) => ({ error }));
+
+			if (!uploadedFile || uploadedFile.error) {
+				const error = uploadedFile?.error;
+				const reason =
+					typeof error === 'string'
+						? error
+						: (error?.detail ?? error?.message ?? $i18n.t('Failed to upload file.'));
+
+				failedCount++;
+				console.error('Upload failed:', displayPath, reason);
+			}
+		}
+
+		if (failedCount > 0) {
+			toast.error(
+				$i18n.t('Upload failed for {{failed}} of {{total}} files.', {
+					failed: failedCount,
+					total: entries.length
+				})
+			);
+		}
+
+		return failedCount;
+	};
+
+	const uploadDirectoryEntries = async (entries: DirectoryFileEntry[]) => {
+		if (!knowledge) return;
+
+		try {
+			syncing = $i18n.t('Computing checksums ({{count}} files)', { count: entries.length });
+			const manifest = await buildDirectoryManifest(entries);
+
+			syncing = $i18n.t('Comparing with knowledge base...');
+			const diff = await syncKnowledgeDiff(
+				localStorage.token,
+				id,
+				manifest.map(({ filename, path, checksum, size }) => ({
+					filename,
+					path: getDirectoryUploadPath(path),
+					checksum,
+					size
+				}))
+			);
+
+			if (!diff) {
+				toast.error($i18n.t('Failed to compare files.'));
+				return;
+			}
+
+			const directoryIdByPath = await createMissingDirectories(diff);
+
+			const failedCount = await uploadManifestEntries(manifest, (entry) =>
+				entry.path ? directoryIdByPath[getDirectoryUploadPath(entry.path)] : currentDirectoryId
+			);
+
+			if (failedCount === 0) {
+				toast.success($i18n.t('File uploaded successfully'));
+			}
+
+			init();
+		} catch (e) {
+			toast.error(`${e}`);
+		} finally {
+			syncing = null;
+		}
+	};
+
 	// Incremental sync: hash locally → diff on server → upload only what changed
 	const syncDirectoryHandler = async () => {
 		if (!pendingSyncFiles?.length) return;
@@ -721,13 +715,7 @@
 			syncing = $i18n.t('Computing checksums ({{count}} files)', {
 				count: pendingSyncFiles.length
 			});
-			const manifest = await Promise.all(
-				pendingSyncFiles.map(async (entry) => ({
-					...entry,
-					checksum: await computeFileHash(entry.file),
-					size: entry.file.size
-				}))
-			);
+			const manifest = await buildDirectoryManifest(pendingSyncFiles);
 			pendingSyncFiles = null;
 
 			// ── 3. Diff against knowledge base ──
@@ -755,23 +743,7 @@
 			}
 
 			// ── 5. mkdir — create missing directories (parents first) ──
-			const directoryIdByPath: Record<string, string> = { ...(diff.directory_map || {}) };
-			for (const dirPath of diff.mkdir) {
-				const segments = dirPath.split('/');
-				const name = segments.at(-1)!;
-				const parentPath = segments.slice(0, -1).join('/');
-				const parentId = parentPath ? directoryIdByPath[parentPath] : null;
-
-				const directory = await createKnowledgeDirectory(
-					localStorage.token,
-					knowledge.id,
-					name,
-					parentId
-				);
-				if (directory) {
-					directoryIdByPath[dirPath] = directory.id;
-				}
-			}
+			const directoryIdByPath = await createMissingDirectories(diff);
 
 			// ── 6. Upload added + modified files ──
 			const filesToUpload = manifest.filter(
@@ -780,36 +752,24 @@
 					diff.modified.some((m: any) => m.filename === entry.filename && m.path === entry.path)
 			);
 
-			let uploadedCount = 0;
-			for (const entry of filesToUpload) {
-				uploadedCount++;
-				const displayPath = entry.path ? `${entry.path}/${entry.filename}` : entry.filename;
-				syncing = $i18n.t('Uploading {{current}}/{{total}}: {{file}}', {
-					current: uploadedCount,
-					total: filesToUpload.length,
-					file: displayPath
-				});
-
-				const fileObject = new File([entry.file], entry.filename, { type: entry.file.type });
-				await uploadFile(localStorage.token, fileObject, {
-					knowledge_id: knowledge.id,
-					file_hash: entry.checksum,
-					directory_id: entry.path ? directoryIdByPath[entry.path] : null
-				}).catch(() => null);
-			}
+			const failedCount = await uploadManifestEntries(filesToUpload, (entry) =>
+				entry.path ? directoryIdByPath[entry.path] : null
+			);
 
 			// ── 7. Report ──
-			toast.success(
-				$i18n.t(
-					'Sync complete: {{added}} added, {{modified}} modified, {{deleted}} deleted, {{unmodified}} unmodified',
-					{
-						added: diff.added.length,
-						modified: diff.modified.length,
-						deleted: diff.deleted.length,
-						unmodified: diff.unmodified_count
-					}
-				)
-			);
+			if (failedCount === 0) {
+				toast.success(
+					$i18n.t(
+						'Sync complete: {{added}} added, {{modified}} modified, {{deleted}} deleted, {{unmodified}} unmodified',
+						{
+							added: diff.added.length,
+							modified: diff.modified.length,
+							deleted: diff.deleted.length,
+							unmodified: diff.unmodified_count
+						}
+					)
+				);
+			}
 			init();
 		} catch (e) {
 			toast.error(`${e}`);
@@ -967,8 +927,11 @@
 		}
 	};
 
+	const openFileHandler = (fileId: string) => {
+		window.open(`${WEBUI_API_BASE_URL}/files/${encodeURIComponent(fileId)}/content`, '_blank');
+	};
+
 	let debounceTimeout = null;
-	let mediaQuery;
 
 	let dragged = false;
 	let isSaving = false;
@@ -1031,12 +994,51 @@
 		}, 1000);
 	};
 
-	const handleMediaQuery = async (e) => {
-		if (e.matches) {
-			largeScreen = true;
-		} else {
-			largeScreen = false;
+	const readDirectoryEntries = async (reader: any) => {
+		const entries: any[] = [];
+
+		while (true) {
+			const batch = await new Promise<any[]>((resolve, reject) => {
+				reader.readEntries(resolve, reject);
+			});
+
+			if (batch.length === 0) {
+				break;
+			}
+
+			entries.push(...batch);
 		}
+
+		return entries;
+	};
+
+	const collectDroppedEntryFiles = async (
+		entry: any,
+		entryPath = entry.name
+	): Promise<DirectoryFileEntry[]> => {
+		if (entry.name.startsWith('.') || hasHiddenFolder(entryPath)) {
+			return [];
+		}
+
+		if (entry.isFile) {
+			const file = await new Promise<File>((resolve, reject) => {
+				entry.file(resolve, reject);
+			});
+			const parts = entryPath.split('/');
+			const filename = parts.pop() || file.name;
+			return [{ path: parts.join('/'), filename, file }];
+		}
+
+		if (entry.isDirectory) {
+			const reader = entry.createReader();
+			const entries = await readDirectoryEntries(reader);
+			const nested = await Promise.all(
+				entries.map((child) => collectDroppedEntryFiles(child, `${entryPath}/${child.name}`))
+			);
+			return nested.flat();
+		}
+
+		return [];
 	};
 
 	const onDragOver = (e) => {
@@ -1063,40 +1065,40 @@
 			return;
 		}
 
-		const handleUploadingFileFolder = (items) => {
-			for (const item of items) {
-				if (item.isFile) {
-					item.file((file) => {
-						uploadFileHandler(file);
-					});
-					continue;
-				}
-
-				// Not sure why you have to call webkitGetAsEntry and isDirectory seperate, but it won't work if you try item.webkitGetAsEntry().isDirectory
-				const wkentry = item.webkitGetAsEntry();
-				const isDirectory = wkentry.isDirectory;
-				if (isDirectory) {
-					// Read the directory
-					wkentry.createReader().readEntries(
-						(entries) => {
-							handleUploadingFileFolder(entries);
-						},
-						(error) => {
-							console.error('Error reading directory entries:', error);
-						}
-					);
-				} else {
-					uploadFileHandler(item.getAsFile());
-				}
-			}
-		};
-
 		if (e.dataTransfer?.types?.includes('Files')) {
 			if (e.dataTransfer?.files) {
 				const inputItems = e.dataTransfer?.items;
 
 				if (inputItems && inputItems.length > 0) {
-					handleUploadingFileFolder(inputItems);
+					const directoryEntries: DirectoryFileEntry[] = [];
+					const looseFiles: File[] = [];
+
+					for (const rawItem of Array.from(inputItems)) {
+						const item = rawItem as DataTransferItem & { webkitGetAsEntry?: () => any };
+						const entry = item.webkitGetAsEntry?.();
+
+						if (entry?.isDirectory) {
+							try {
+								directoryEntries.push(...(await collectDroppedEntryFiles(entry)));
+							} catch (error) {
+								handleUploadError(error);
+								return;
+							}
+						} else {
+							const file = item.getAsFile();
+							if (file) {
+								looseFiles.push(file);
+							}
+						}
+					}
+
+					for (const file of looseFiles) {
+						await uploadFileHandler(file);
+					}
+
+					if (directoryEntries.length > 0) {
+						await uploadDirectoryEntries(directoryEntries);
+					}
 				} else {
 					toast.error($i18n.t(`File not found.`));
 				}
@@ -1105,42 +1107,6 @@
 	};
 
 	onMount(async () => {
-		// listen to resize 1024px
-		mediaQuery = window.matchMedia('(min-width: 1024px)');
-
-		mediaQuery.addEventListener('change', handleMediaQuery);
-		handleMediaQuery(mediaQuery);
-
-		// Select the container element you want to observe
-		const container = document.getElementById('collection-container');
-
-		// initialize the minSize based on the container width
-		minSize = !largeScreen ? 100 : Math.floor((300 / container.clientWidth) * 100);
-
-		// Create a new ResizeObserver instance
-		const resizeObserver = new ResizeObserver((entries) => {
-			for (let entry of entries) {
-				const width = entry.contentRect.width;
-				// calculate the percentage of 300
-				const percentage = (300 / width) * 100;
-				// set the minSize to the percentage, must be an integer
-				minSize = !largeScreen ? 100 : Math.floor(percentage);
-
-				if (showSidepanel) {
-					if (pane && pane.isExpanded() && pane.getSize() < minSize) {
-						pane.resize(minSize);
-					}
-				}
-			}
-		});
-
-		// Start observing the container's size changes
-		resizeObserver.observe(container);
-
-		if (pane) {
-			pane.expand();
-		}
-
 		id = $page.params.id;
 		const res = await getKnowledgeById(localStorage.token, id).catch((e) => {
 			toast.error(`${e}`);
@@ -1169,7 +1135,6 @@
 			clearInterval(pendingPollTimer);
 			pendingPollTimer = null;
 		}
-		mediaQuery?.removeEventListener('change', handleMediaQuery);
 		const dropZone = document.querySelector('body');
 		dropZone?.removeEventListener('dragover', onDragOver);
 		dropZone?.removeEventListener('drop', onDrop);
@@ -1266,13 +1231,24 @@
 			accessRoles={['read', 'write']}
 		/>
 		<div class="w-full px-2">
+			<button
+				class="mb-1 flex h-6 w-fit items-center gap-1 rounded-md text-xs text-gray-400 transition-colors duration-75 hover:text-gray-700 dark:text-gray-600 dark:hover:text-gray-300"
+				type="button"
+				on:click={() => {
+					goto('/workspace/knowledge');
+				}}
+			>
+				<ChevronLeft className="size-3" strokeWidth="2" />
+				<span>{$i18n.t('Back')}</span>
+			</button>
+
 			<div class=" flex w-full">
-				<div class="flex-1">
+				<div class="flex-1 px-1">
 					<div class="flex items-center justify-between w-full">
 						<div class="w-full flex justify-between items-center">
 							<input
 								type="text"
-								class="text-left w-full text-lg bg-transparent outline-hidden flex-1"
+								class="text-left w-full text-sm bg-transparent outline-hidden flex-1"
 								bind:value={knowledge.name}
 								aria-label={$i18n.t('Knowledge Name')}
 								placeholder={$i18n.t('Knowledge Name')}
@@ -1296,19 +1272,11 @@
 
 						{#if knowledge?.write_access}
 							<div class="self-center shrink-0">
-								<button
-									class="bg-gray-50 hover:bg-gray-100 text-black dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-white transition px-2 py-1 rounded-full flex gap-1 items-center"
-									type="button"
+								<AccessButton
 									on:click={() => {
 										showAccessControlModal = true;
 									}}
-								>
-									<LockClosed strokeWidth="2.5" className="size-3.5" />
-
-									<div class="text-sm font-medium shrink-0">
-										{$i18n.t('Access')}
-									</div>
-								</button>
+								/>
 							</div>
 						{:else}
 							<div class="text-xs shrink-0 text-gray-500">
@@ -1349,7 +1317,7 @@
 		</div>
 
 		<div
-			class="mt-2 mb-2.5 py-2 -mx-0 bg-white dark:bg-gray-900 rounded-3xl border border-gray-100/30 dark:border-gray-850/30 flex-1"
+			class="mt-1.5 mb-2 py-1.5 -mx-0 bg-white dark:bg-gray-900 rounded-3xl border border-gray-100/30 dark:border-gray-850/30 flex-1"
 		>
 			{#if isExternalKnowledge}
 				<div class="p-5 flex flex-col gap-4">
@@ -1384,21 +1352,24 @@
 					</div>
 
 					<div class="text-xs text-gray-500">
+						<!-- LICENSE covers this Open WebUI wordmark.
+						Do not alter, remove, obscure, or replace it except as LICENSE permits:
+						https://docs.openwebui.com/license. -->
 						{$i18n.t(
 							'This knowledge base retrieves from a connected source. Open WebUI can query it, but cannot upload, sync, edit, delete, reset, or reindex its source data.'
 						)}
 					</div>
 
 					<div class="flex flex-col gap-2">
-						<div class="font-medium text-sm">{$i18n.t('Test Query')}</div>
+						<div class="text-xs">{$i18n.t('Test Query')}</div>
 						<div class="flex gap-2">
 							<input
-								class="w-full text-sm rounded-xl bg-gray-50 dark:bg-gray-850 px-3 py-2 outline-hidden"
+								class="w-full text-xs rounded-xl bg-gray-50 dark:bg-gray-850 px-3 py-2 outline-hidden"
 								bind:value={externalTestQuery}
 								placeholder={$i18n.t('Ask this knowledge source a test question')}
 							/>
 							<button
-								class="px-3 py-2 rounded-xl bg-black text-white dark:bg-white dark:text-black text-sm"
+								class="px-3 py-2 rounded-xl bg-black text-white dark:bg-white dark:text-black text-xs"
 								on:click={externalTestHandler}
 							>
 								{$i18n.t('Test')}
@@ -1408,7 +1379,7 @@
 
 					{#if externalTestResult}
 						<div class="rounded-xl bg-gray-50 dark:bg-gray-850 p-3 text-xs">
-							<div class="font-medium mb-2">{$i18n.t('Preview')}</div>
+							<div class="mb-2">{$i18n.t('Preview')}</div>
 							{#each externalTestResult.documents ?? [] as document, idx}
 								<div class="border-t border-gray-100 dark:border-gray-800 py-2">
 									<div class="line-clamp-4">{document}</div>
@@ -1421,13 +1392,13 @@
 					{/if}
 				</div>
 			{:else}
-				<div class="px-3.5 flex flex-1 items-center w-full space-x-2 py-0.5 pb-2">
+				<div class="px-3 flex flex-1 items-center w-full space-x-1.5">
 					<div class="flex flex-1 items-center">
-						<div class=" self-center ml-1 mr-3">
+						<div class=" self-center ml-1 mr-2">
 							<Search className="size-3.5" />
 						</div>
 						<input
-							class=" w-full text-sm pr-4 py-1 rounded-r-xl outline-hidden bg-transparent"
+							class=" w-full text-xs pr-4 py-1 rounded-r-xl outline-hidden bg-transparent"
 							bind:value={query}
 							on:input={handleSearchInput}
 							aria-label={$i18n.t('Search Collection')}
@@ -1442,32 +1413,32 @@
 
 						<Dropdown align="end">
 							<button
-								class="p-1.5 mr-1 rounded-xl text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+								class="p-1.5 mr-1 rounded-xl text-gray-500 bg-transparent hover:text-gray-900 dark:hover:text-gray-100 transition"
 								type="button"
 							>
 								<AdjustmentsHorizontal className="size-3.5" strokeWidth="2" />
 							</button>
 
 							<div slot="content">
-								<div
-									class="min-w-[180px] rounded-2xl px-1 py-1 border border-gray-100 dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
-								>
+								<DropdownMenu className="min-w-[11.25rem]">
 									<button
-										class="select-none flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+										class="select-none flex h-[1.6875rem] w-full cursor-pointer items-center gap-2 rounded-xl bg-transparent px-2 text-[0.8125rem] hover:text-gray-900 dark:hover:text-gray-100"
 										type="button"
 										on:click={() => {
 											includeContent = !includeContent;
+											currentPage = 1;
 										}}
 									>
 										<Checkbox
 											state={includeContent ? 'checked' : 'unchecked'}
 											on:change={(e) => {
 												includeContent = e.detail === 'checked';
+												currentPage = 1;
 											}}
 										/>
 										{$i18n.t('File content')}
 									</button>
-								</div>
+								</DropdownMenu>
 							</div>
 						</Dropdown>
 
@@ -1502,7 +1473,7 @@
 					</div>
 				</div>
 
-				<div class="px-3 flex justify-between">
+				<div class="px-2.5 flex justify-between">
 					<div
 						class="flex w-full bg-transparent overflow-x-auto scrollbar-none"
 						on:wheel={(e) => {
@@ -1513,11 +1484,11 @@
 						}}
 					>
 						<div
-							class="flex gap-3 w-fit text-center text-sm rounded-full bg-transparent px-0.5 whitespace-nowrap"
+							class="flex gap-2 w-fit text-center text-sm rounded-full bg-transparent px-0.5 whitespace-nowrap"
 						>
 							<DropdownOptions
-								align="start"
-								className="flex shrink-0 items-center gap-2 px-3 py-1.5 text-sm bg-gray-50 dark:bg-gray-850 rounded-xl placeholder-gray-400 outline-hidden focus:outline-hidden"
+								align="end"
+								className="flex h-8 shrink-0 items-center gap-1.5 rounded-xl bg-transparent px-1.5 text-xs text-gray-700 transition placeholder-gray-400 outline-hidden hover:text-gray-900 focus:outline-hidden dark:text-gray-200 dark:hover:text-gray-100"
 								bind:value={viewOption}
 								items={[
 									{ value: null, label: $i18n.t('All') },
@@ -1530,23 +1501,24 @@
 									} else {
 										delete localStorage.workspaceViewOption;
 									}
+									currentPage = 1;
 								}}
 							/>
 
 							<DropdownOptions
-								align="start"
+								align="end"
 								bind:value={sortKey}
 								placeholder={$i18n.t('Sort')}
 								items={[
 									{ value: 'name', label: $i18n.t('Name') },
-									{ value: 'created_at', label: $i18n.t('Created At') },
-									{ value: 'updated_at', label: $i18n.t('Updated At') }
+									{ value: 'created_at', label: $i18n.t('Created') },
+									{ value: 'updated_at', label: $i18n.t('Updated') }
 								]}
 							/>
 
 							{#if sortKey}
 								<DropdownOptions
-									align="start"
+									align="end"
 									bind:value={direction}
 									items={[
 										{ value: 'asc', label: $i18n.t('Asc') },
@@ -1559,7 +1531,7 @@
 				</div>
 
 				{#if currentDirectoryId !== null}
-					<div class="px-5 mt-2">
+					<div class="px-4 mb-1">
 						<KnowledgeBreadcrumbs
 							rootLabel={knowledge.name}
 							{breadcrumbs}
@@ -1571,8 +1543,10 @@
 				{/if}
 
 				{#if syncing}
-					<div class="mx-2.5 mt-2.5 -mb-0.5">
-						<div class="flex items-center gap-2.5 rounded-xl py-2 px-3 bg-gray-50 dark:bg-gray-850">
+					<div class="mx-2 mt-2 -mb-0.5">
+						<div
+							class="flex items-center gap-2 rounded-xl py-1.5 px-2.5 bg-gray-50 dark:bg-gray-850"
+						>
 							<Spinner className="size-3.5 shrink-0" />
 							<div class="text-xs text-gray-500 dark:text-gray-400 truncate">
 								{syncing}
@@ -1582,7 +1556,7 @@
 				{/if}
 
 				{#if fileItems !== null && fileItemsTotal !== null}
-					<div class="flex flex-row flex-1 gap-3 px-2.5 mt-2">
+					<div class="flex flex-row flex-1 gap-2 px-2">
 						<div class="flex-1 flex">
 							<div class=" flex flex-col w-full space-x-2 rounded-lg h-full">
 								<div class="w-full h-full flex flex-col min-h-full">
@@ -1659,7 +1633,7 @@
 										<div class="shrink-0 flex items-center p-2">
 											<div class="mr-2">
 												<button
-													class="w-full text-left text-sm p-1.5 rounded-lg dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-gray-850"
+													class="w-full text-left text-xs p-1.5 rounded-lg dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-gray-850"
 													aria-label={$i18n.t('Close')}
 													on:click={() => {
 														selectedFileId = null;
@@ -1671,14 +1645,24 @@
 													<ChevronLeft strokeWidth="2.5" />
 												</button>
 											</div>
-											<div class=" flex-1 text-lg line-clamp-1">
-												{selectedFile?.meta?.name}
+											<div class="flex-1 text-sm line-clamp-1">
+												<a
+													href="#"
+													class="hover:underline line-clamp-1"
+													on:click|preventDefault={() => {
+														if (selectedFile?.id) {
+															openFileHandler(selectedFile.id);
+														}
+													}}
+												>
+													{selectedFile?.meta?.name}
+												</a>
 											</div>
 
 											{#if knowledge?.write_access}
 												<div>
 													<button
-														class="flex self-center w-fit text-sm py-1 px-2.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
+														class="flex self-center w-fit text-xs py-1 px-2.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
 														disabled={isSaving || loadingFileContent}
 														on:click={() => {
 															updateFileContentHandler();
@@ -1697,7 +1681,7 @@
 
 										{#key selectedFile?.id}
 											<textarea
-												class="w-full h-full text-sm outline-none resize-none px-3 py-2"
+												class="w-full h-full text-xs outline-none resize-none px-3 py-2"
 												bind:value={selectedFileContent}
 												disabled={!knowledge?.write_access || loadingFileContent}
 												aria-label={$i18n.t('File content')}
