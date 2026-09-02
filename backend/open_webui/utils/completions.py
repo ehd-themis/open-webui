@@ -134,55 +134,102 @@ async def chat_stream_to_completions_stream(chat_stream_generator, model: str = 
             chunk['usage'] = usage
         return chunk
 
+    def _make_usage_chunk(usage):
+        return {
+            'id': cmpl_id,
+            'object': 'text_completion',
+            'created': created,
+            'model': model,
+            'choices': [],
+            'usage': usage,
+        }
+
     # Echo the prompt back first if requested.
     if echo_prompt:
         yield f'data: {json.dumps(_make_chunk(echo_prompt, 0, None))}\n\n'.encode()
 
+    def _convert_line(line):
+        """Convert one SSE line to zero or more legacy chunks. Returns (chunks, stop)."""
+        line = line.strip()
+        if not line or not line.startswith('data:'):
+            return [], False
+
+        data_str = line[5:].strip()
+        if data_str == '[DONE]':
+            return [], False
+
+        try:
+            data = json.loads(data_str)
+        except (json.JSONDecodeError, TypeError):
+            return [], False
+        if not isinstance(data, dict):
+            return [], False
+
+        out = []
+        choices = data.get('choices') or []
+        usage = data.get('usage')
+
+        if not choices:
+            # Error event (e.g. context overflow, model load failure): surface it
+            # instead of ending with an empty, apparently successful completion.
+            if data.get('error'):
+                log.warning(f'Upstream error while streaming completions: {data["error"]}')
+                out.append({'error': data['error']})
+                return out, True
+            # Final usage-only chunk.
+            if usage:
+                out.append(_make_usage_chunk(usage))
+            return out, False
+
+        emitted = 0
+        for choice in choices:
+            index = choice.get('index', 0)
+            delta = choice.get('delta', {}) or {}
+            text = delta.get('content')
+            finish_reason = choice.get('finish_reason')
+
+            # Skip role-only / empty keep-alive deltas.
+            if text is None and finish_reason is None:
+                continue
+
+            out.append(_make_chunk(text or '', index, finish_reason))
+            emitted += 1
+
+        # Some providers (e.g. the Ollama conversion) put usage on the final
+        # choice-bearing chunk rather than on a trailing usage-only chunk.
+        if usage:
+            if emitted:
+                out[-1]['usage'] = usage
+            else:
+                out.append(_make_usage_chunk(usage))
+        return out, False
+
+    # Upstream may relay raw network reads, so an SSE line can be split across
+    # chunks: buffer partial lines instead of dropping them.
+    pending = ''
+    stopped = False
     try:
         async for chunk in chat_stream_generator:
             if isinstance(chunk, bytes):
                 chunk = chunk.decode('utf-8', errors='ignore')
 
-            for line in chunk.split('\n'):
-                line = line.strip()
-                if not line or not line.startswith('data:'):
-                    continue
+            pending += chunk
+            lines = pending.split('\n')
+            pending = lines.pop()
 
-                data_str = line[5:].strip()
-                if data_str == '[DONE]':
-                    continue
+            for line in lines:
+                chunks, stopped = _convert_line(line)
+                for c in chunks:
+                    yield f'data: {json.dumps(c)}\n\n'.encode()
+                if stopped:
+                    break
+            if stopped:
+                break
 
-                try:
-                    data = json.loads(data_str)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-
-                choices = data.get('choices', [])
-                if not choices:
-                    # Final usage-only chunk.
-                    if data.get('usage'):
-                        usage_chunk = {
-                            'id': cmpl_id,
-                            'object': 'text_completion',
-                            'created': created,
-                            'model': model,
-                            'choices': [],
-                            'usage': data['usage'],
-                        }
-                        yield f'data: {json.dumps(usage_chunk)}\n\n'.encode()
-                    continue
-
-                for choice in choices:
-                    index = choice.get('index', 0)
-                    delta = choice.get('delta', {}) or {}
-                    text = delta.get('content')
-                    finish_reason = choice.get('finish_reason')
-
-                    # Skip role-only / empty keep-alive deltas.
-                    if text is None and finish_reason is None:
-                        continue
-
-                    yield f'data: {json.dumps(_make_chunk(text or "", index, finish_reason))}\n\n'.encode()
+        if pending.strip() and not stopped:
+            chunks, stopped = _convert_line(pending)
+            for c in chunks:
+                yield f'data: {json.dumps(c)}\n\n'.encode()
 
     except Exception as e:
         log.error(f'Error in completions stream conversion: {e}')

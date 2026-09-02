@@ -1746,6 +1746,14 @@ async def completions(
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
 
+    # generate_chat_completion answers 503 when the admin has disabled the
+    # OpenAI API. Answer 404 here instead so /api/completions still falls back
+    # to the chat pipeline for non-OpenAI backends (e.g. Ollama-only setups),
+    # and so a stale per-worker OPENAI_MODELS cache can't proxy to a disabled
+    # connection.
+    if not await Config.get('openai.enable'):
+        raise HTTPException(status_code=404, detail=ERROR_MESSAGES.MODEL_NOT_FOUND())
+
     payload = {**form_data}
     metadata = payload.pop('metadata', None)
 
@@ -1789,6 +1797,11 @@ async def completions(
     payload['model'] = strip_provider_model_prefix(payload['model'], prefix_id)
     requested_model = payload.get('model')
 
+    if 'logit_bias' in payload and payload['logit_bias']:
+        logit_bias = convert_logit_bias_input_to_json(payload['logit_bias'])
+        if logit_bias:
+            payload['logit_bias'] = JSONCodec.loads(logit_bias)
+
     is_streaming_request = bool(payload.get('stream', False))
 
     headers, cookies = await get_headers_and_cookies(request, url, key, api_config, metadata, user=user)
@@ -1827,31 +1840,30 @@ async def completions(
             timeout=get_client_timeout(stream=is_streaming_request),
         )
 
+        # 404/405 are the documented "no native /completions here" signal that
+        # /api/completions turns into a chat-completions fallback, so they are
+        # not reported as provider failures (every IDE autocomplete request on a
+        # chat-only backend would otherwise emit a warning and an event).
+        is_fallback_status = r.status in (404, 405)
+
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             # If the provider returned an error status with SSE content-type,
             # read the body and return a proper error response instead of
             # streaming the error back (which hides the error from logs).
             if r.status >= 400:
                 error_body = await r.text()
-                log.error(
-                    'Provider returned HTTP %d with SSE content-type: %s',
-                    r.status,
-                    error_body[:1000],
-                )
+                if not is_fallback_status:
+                    log.error(
+                        'Provider returned HTTP %d with SSE content-type: %s',
+                        r.status,
+                        error_body[:1000],
+                    )
                 try:
                     error_json = JSONCodec.loads(error_body)
-                    await publish_model_provider_request_failed(
-                        request,
-                        actor=user,
-                        provider='openai-compatible',
-                        base_url=url,
-                        api_key=key,
-                        status=r.status,
-                        requested_model=requested_model,
-                        upstream_error=error_json,
-                    )
-                    return JSONResponse(status_code=r.status, content=error_json)
                 except JSONCodec.JSONDecodeError:
+                    error_json = None
+
+                if not is_fallback_status:
                     await publish_model_provider_request_failed(
                         request,
                         actor=user,
@@ -1860,12 +1872,14 @@ async def completions(
                         api_key=key,
                         status=r.status,
                         requested_model=requested_model,
-                        upstream_error=error_body,
+                        upstream_error=error_json if error_json is not None else error_body,
                     )
-                    return JSONResponse(
-                        status_code=r.status,
-                        content={'error': {'message': error_body, 'code': r.status}},
-                    )
+                if error_json is not None:
+                    return JSONResponse(status_code=r.status, content=error_json)
+                return JSONResponse(
+                    status_code=r.status,
+                    content={'error': {'message': error_body, 'code': r.status}},
+                )
 
             streaming = True
             return StreamingResponse(
@@ -1880,16 +1894,17 @@ async def completions(
                 response_data = await r.text()
 
             if r.status >= 400:
-                await publish_model_provider_request_failed(
-                    request,
-                    actor=user,
-                    provider='openai-compatible',
-                    base_url=url,
-                    api_key=key,
-                    status=r.status,
-                    requested_model=requested_model,
-                    upstream_error=response_data,
-                )
+                if not is_fallback_status:
+                    await publish_model_provider_request_failed(
+                        request,
+                        actor=user,
+                        provider='openai-compatible',
+                        base_url=url,
+                        api_key=key,
+                        status=r.status,
+                        requested_model=requested_model,
+                        upstream_error=response_data,
+                    )
                 if isinstance(response_data, (dict, list)):
                     return JSONResponse(status_code=r.status, content=response_data)
                 else:
