@@ -10,6 +10,22 @@ log = logging.getLogger(__name__)
 # be forwarded to the Chat Completions handler.
 LEGACY_ONLY_KEYS = {'prompt', 'suffix', 'echo', 'best_of', 'logprobs'}
 
+# Task recorded for /api/completions requests, which come from IDE autocomplete
+# rather than an interactive chat. Connection headers templated with {{TASK}}
+# (e.g. X-Gateway-Task) render it, so a gateway can tell the two apart.
+COMPLETIONS_TASK = 'autocomplete'
+
+
+def with_completions_task(form_data: dict) -> dict:
+    """
+    Return a copy of a legacy completions payload whose ``metadata.task`` is
+    set: the caller's own task if it gave one, :data:`COMPLETIONS_TASK`
+    otherwise. The rest of the caller's metadata (e.g. ``chat_id``) is kept.
+    """
+    metadata = form_data.get('metadata')
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return {**form_data, 'metadata': {**metadata, 'task': metadata.get('task') or COMPLETIONS_TASK}}
+
 
 def normalize_completion_prompt(prompt) -> str:
     """
