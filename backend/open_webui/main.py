@@ -1273,6 +1273,10 @@ async def chat_completion(
             },
         }
 
+        # Set by the /api/completions chat fallback (see _completions_via_chat).
+        if getattr(request.state, 'task', None):
+            metadata['task'] = request.state.task
+
         if is_new_chat:
             metadata['chat_id'] = str(uuid4())
 
@@ -2054,6 +2058,7 @@ from open_webui.utils.completions import (
     convert_chat_to_completions_response,
     convert_completions_to_chat_payload,
     normalize_completion_prompt,
+    with_completions_task,
 )
 
 
@@ -2072,6 +2077,9 @@ async def _completions_via_chat(request: Request, form_data: dict, user, request
         echo_prompt = normalize_completion_prompt(form_data.get('prompt', ''))
 
     chat_payload = convert_completions_to_chat_payload(form_data)
+    # chat_completion builds its own metadata; pass the task through the request
+    # state so the fallback is forwarded as a task too.
+    request.state.task = form_data['metadata']['task']
     response = await chat_completion(request, chat_payload, user)
 
     if isinstance(response, StreamingResponse):
@@ -2116,7 +2124,11 @@ async def completions(
     chat-only APIs) return ``404``/``405``; in that case the request falls back
     to a Chat Completions conversion so the endpoint still works. Both
     streaming and non-streaming requests are supported.
+
+    Both paths forward the request as a task (``metadata.task``, rendered by
+    ``{{TASK}}`` header templates): ``autocomplete`` unless the caller set one.
     """
+    form_data = with_completions_task(form_data)
     requested_model = form_data.get('model', '')
 
     # Primary path: proxy verbatim to the provider's native /completions route.
