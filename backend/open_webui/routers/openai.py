@@ -86,6 +86,12 @@ def _clean_proxy_headers(raw_headers) -> dict:
     return {k: v for k, v in raw_headers.items() if k.lower() not in _STRIP_PROXY_HEADERS}
 
 
+def _retry_after_headers(raw_headers) -> dict | None:
+    """Return the upstream ``Retry-After`` header, if any, to forward on an error response."""
+    retry_after = raw_headers.get('Retry-After')
+    return {'Retry-After': retry_after} if retry_after else None
+
+
 async def send_get_request(
     request: Request = None,
     url=None,
@@ -1774,7 +1780,8 @@ async def completions(
 
     Returns the upstream response unchanged: a ``dict`` for non-streaming
     requests, a :class:`StreamingResponse` for SSE, or a ``JSONResponse`` /
-    ``PlainTextResponse`` carrying the upstream error status. Providers that do
+    ``PlainTextResponse`` carrying the upstream error status (and its
+    ``Retry-After`` header, if any). Providers that do
     not expose a ``/completions`` route surface as a ``404``/``405`` response,
     which the public ``/api/completions`` handler uses to fall back to a chat
     completions conversion.
@@ -1881,6 +1888,10 @@ async def completions(
         # not reported as provider failures (every IDE autocomplete request on a
         # chat-only backend would otherwise emit a warning and an event).
         is_fallback_status = r.status in (404, 405)
+        # Error responses keep the upstream Retry-After (e.g. a gateway answering
+        # 503 while the model loads) so IDE clients can back off without parsing
+        # the body. Other upstream headers are not forwarded on errors.
+        error_headers = _retry_after_headers(r.headers)
 
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             # If the provider returned an error status with SSE content-type,
@@ -1911,10 +1922,11 @@ async def completions(
                         upstream_error=error_json if error_json is not None else error_body,
                     )
                 if error_json is not None:
-                    return JSONResponse(status_code=r.status, content=error_json)
+                    return JSONResponse(status_code=r.status, content=error_json, headers=error_headers)
                 return JSONResponse(
                     status_code=r.status,
                     content={'error': {'message': error_body, 'code': r.status}},
+                    headers=error_headers,
                 )
 
             streaming = True
@@ -1942,9 +1954,9 @@ async def completions(
                         upstream_error=response_data,
                     )
                 if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data)
+                    return JSONResponse(status_code=r.status, content=response_data, headers=error_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data)
+                    return PlainTextResponse(status_code=r.status, content=response_data, headers=error_headers)
 
             return response_data
     except Exception as e:

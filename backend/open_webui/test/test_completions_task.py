@@ -19,13 +19,18 @@ USER = SimpleNamespace(id='user-1', name='Dev', email='dev@example.com', role='u
 class FakeResponse:
     closed = True  # nothing for cleanup_response to release
 
-    def __init__(self, status, body):
+    def __init__(self, status, body, headers):
         self.status = status
-        self.headers = {'Content-Type': 'application/json'}
+        self.headers = headers
         self.body = body
 
     async def json(self, loads=None):
+        if isinstance(self.body, str):
+            raise ValueError('not a JSON body')
         return self.body
+
+    async def text(self):
+        return self.body if isinstance(self.body, str) else json.dumps(self.body)
 
 
 class FakeSession:
@@ -33,12 +38,13 @@ class FakeSession:
 
     def __init__(self):
         self.status = 200
+        self.headers = {'Content-Type': 'application/json'}
         self.body = {'object': 'text_completion', 'choices': [{'text': ' return n'}]}
         self.calls = []
 
     async def request(self, **kwargs):
         self.calls.append(kwargs)
-        return FakeResponse(self.status, self.body)
+        return FakeResponse(self.status, self.body, self.headers)
 
 
 def make_request():
@@ -70,11 +76,15 @@ def upstream(monkeypatch):
     async def get_session():
         return session
 
+    async def publish_model_provider_request_failed(*args, **kwargs):
+        return None
+
     monkeypatch.setattr(openai_router, 'Config', SimpleNamespace(get=config_get))
     monkeypatch.setattr(openai_router, 'Models', SimpleNamespace(get_model_by_id=get_model_by_id))
     monkeypatch.setattr(openai_router, 'check_model_access', check_model_access)
     monkeypatch.setattr(openai_router, 'get_openai_connection', get_openai_connection)
     monkeypatch.setattr(openai_router, 'get_session', get_session)
+    monkeypatch.setattr(openai_router, 'publish_model_provider_request_failed', publish_model_provider_request_failed)
     return session
 
 
@@ -134,3 +144,45 @@ async def test_chat_fallback_is_marked_as_task(upstream, monkeypatch):
 
     assert seen['task'] == 'autocomplete'
     assert response['choices'][0]['text'] == ' return n'
+
+
+MODEL_LOADING = {
+    'error': {
+        'message': 'Le modèle zeta-2.1 est en cours de chargement, réessayez dans 30 secondes.',
+        'type': 'model_loading',
+        'code': 503,
+    }
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'content_type, body',
+    [
+        ('application/json', MODEL_LOADING),
+        ('text/event-stream', MODEL_LOADING),  # error status sent with an SSE content-type
+        ('text/plain', 'model loading'),
+    ],
+)
+async def test_retry_after_reaches_client_on_503(upstream, content_type, body):
+    # A gateway loading a cold model answers 503 with Retry-After (seconds).
+    upstream.status, upstream.body = 503, body
+    upstream.headers = {'Content-Type': content_type, 'Retry-After': '30', 'X-Upstream-Node': 'gpu-2'}
+
+    response = await main.completions(make_request(), {'model': MODEL_ID, 'prompt': 'def fib(n):'}, USER)
+
+    assert response.status_code == 503
+    assert response.headers['Retry-After'] == '30'
+    assert 'X-Upstream-Node' not in response.headers  # only Retry-After is forwarded
+    content = response.body.decode()
+    assert (json.loads(content) if isinstance(body, dict) else content) == body
+
+
+@pytest.mark.asyncio
+async def test_error_without_retry_after_adds_no_header(upstream):
+    upstream.status, upstream.body = 500, {'error': {'message': 'boom'}}
+
+    response = await main.completions(make_request(), {'model': MODEL_ID, 'prompt': 'def fib(n):'}, USER)
+
+    assert response.status_code == 500
+    assert 'Retry-After' not in response.headers
