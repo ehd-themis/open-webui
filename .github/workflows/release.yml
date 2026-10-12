@@ -53,15 +53,18 @@ jobs:
           PY
 
       - name: Publish GitHub release
+        id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "v${{ steps.pkg.outputs.version }}" &>/dev/null; then
             echo "Release v${{ steps.pkg.outputs.version }} already exists — skipping creation"
+            echo "created=false" >> $GITHUB_OUTPUT
           else
             gh release create "v${{ steps.pkg.outputs.version }}" \
               --title "v${{ steps.pkg.outputs.version }}" \
               --notes-file /tmp/release-notes.md
+            echo "created=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Archive source
@@ -74,7 +77,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Skip for an existing release: its images were built when it was cut, and
+      # dispatching on an old tag runs that tag's (possibly outdated) docker.yaml
       - name: Trigger Docker build
+        if: steps.release.outputs.created == 'true'
         uses: actions/github-script@v8
         with:
           script: |
