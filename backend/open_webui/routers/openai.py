@@ -10,7 +10,6 @@ from urllib.parse import quote, urlparse
 import aiofiles
 import aiohttp
 from aiocache import cached
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import (
     FileResponse,
@@ -28,7 +27,6 @@ from open_webui.env import (
     BYPASS_MODEL_ACCESS_CONTROL,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     ENABLE_OPENAI_API_PASSTHROUGH,
-    FORWARD_SESSION_INFO_HEADER_CHAT_ID,
     MODELS_CACHE_TTL,
     REDIS_KEY_PREFIX,
 )
@@ -42,7 +40,7 @@ from open_webui.models.users import UserModel
 from open_webui.utils.access_control import check_model_access, has_connection_access, has_permission
 from open_webui.utils.anthropic import ANTHROPIC_VERSION, get_anthropic_models, is_anthropic_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.headers import get_custom_headers, include_user_info_headers
+from open_webui.utils.headers import get_headers_and_cookies, include_user_info_headers
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import convert_logit_bias_input_to_json
 from open_webui.utils.model_ids import strip_provider_model_prefix
@@ -84,12 +82,6 @@ BASE_MODELS_CACHE_KEY = f'{REDIS_KEY_PREFIX}:models:base'
 def _clean_proxy_headers(raw_headers) -> dict:
     """Return a copy of *raw_headers* without the encoding, server and date headers."""
     return {k: v for k, v in raw_headers.items() if k.lower() not in _STRIP_PROXY_HEADERS}
-
-
-def _retry_after_headers(raw_headers) -> dict | None:
-    """Return the upstream ``Retry-After`` header, if any, to forward on an error response."""
-    retry_after = raw_headers.get('Retry-After')
-    return {'Retry-After': retry_after} if retry_after else None
 
 
 async def send_get_request(
@@ -156,87 +148,6 @@ def openai_reasoning_model_handler(payload):
             payload['messages'][0]['role'] = 'developer'
 
     return payload
-
-
-async def get_headers_and_cookies(
-    request: Request,
-    url,
-    key=None,
-    config=None,
-    metadata: dict | None = None,
-    user: UserModel = None,
-):
-    cookies = getattr(request, 'cookies', {}) if config.get('forward_cookies', False) else {}
-    headers = {
-        'Content-Type': 'application/json',
-        **(
-            {
-                # LICENSE covers this Open WebUI upstream metadata identifier.
-                # Do not alter, remove, obscure, or replace it except as LICENSE permits:
-                # https://docs.openwebui.com/license.
-                'HTTP-Referer': 'https://openwebui.com/',
-                'X-Title': 'Open WebUI',
-            }
-            if 'openrouter.ai' in url
-            else {}
-        ),
-    }
-
-    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-        headers = include_user_info_headers(headers, user, request=request)
-        if metadata and metadata.get('chat_id'):
-            headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get('chat_id')
-
-    token = None
-    auth_type = config.get('auth_type')
-
-    if auth_type == 'bearer' or auth_type is None:
-        # Default to bearer if not specified
-        token = f'{key}'
-    elif auth_type == 'none':
-        token = None
-    elif auth_type == 'session':
-        token = request.state.token.credentials
-    elif auth_type == 'system_oauth':
-        oauth_token = None
-        try:
-            if request.cookies.get('oauth_session_id', None):
-                oauth_token = await request.app.state.oauth_manager.get_oauth_token(
-                    user.id,
-                    request.cookies.get('oauth_session_id', None),
-                )
-        except Exception as e:
-            log.error(f'Error getting OAuth token: {e}')
-
-        if oauth_token:
-            token = f'{oauth_token.get("access_token", "")}'
-
-    elif auth_type in ('azure_ad', 'microsoft_entra_id'):
-        token = get_microsoft_entra_id_access_token()
-
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-
-    if config.get('headers') and isinstance(config.get('headers'), dict):
-        custom_headers = await get_custom_headers(config.get('headers'), user, metadata, request=request)
-        headers.update(custom_headers)
-
-    return headers, cookies
-
-
-def get_microsoft_entra_id_access_token():
-    """
-    Get Microsoft Entra ID access token using DefaultAzureCredential for Azure OpenAI.
-    Returns the token string or None if authentication fails.
-    """
-    try:
-        token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(), 'https://cognitiveservices.azure.com/.default'
-        )
-        return token_provider()
-    except Exception as e:
-        log.error(f'Error getting Microsoft Entra ID access token: {e}')
-        return None
 
 
 ##########################################
@@ -349,7 +260,7 @@ async def get_openai_connection(idx: int) -> tuple[str, str, dict]:
     return url, key, api_config
 
 
-async def clear_openai_model_cache(request: Request):
+async def clear_models_cache(request: Request):
     await get_all_models.cache.clear()
     redis = getattr(request.app.state, 'redis', None)
     if redis is not None:
@@ -580,7 +491,7 @@ async def update_config(request: Request, form_data: OpenAIConfigForm, user=Depe
         }
     )
 
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
 
     await publish_event(
         request,
@@ -772,7 +683,9 @@ async def get_filtered_models(models, user, db=None):
     # Filter models based on user access control
     model_ids = [model['id'] for model in models.get('data', [])]
     model_infos = {model_info.id: model_info for model_info in await Models.get_models_by_ids(model_ids, db=db)}
-    user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id, db=db)}
+    user_group_ids = {
+        group.id for group in await Groups.get_groups_by_member_id(user.id, db=db, include_inherited=True)
+    }
 
     # Batch-fetch accessible resource IDs in a single query instead of N has_access calls
     accessible_model_ids = await AccessGrants.get_accessible_resource_ids(
@@ -969,7 +882,7 @@ async def download_provider_model(
     payload['model'] = strip_provider_model_prefix(payload['model'], api_config.get('prefix_id'))
 
     result = await send_model_management_request(request, url_idx, 'download', 'POST', payload, user=user)
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
     await publish_event(
         request,
         EVENTS.MODEL_PROVIDER_MODEL_CREATED,
@@ -1008,7 +921,7 @@ async def load_provider_model(
     payload['model'] = strip_provider_model_prefix(payload['model'], api_config.get('prefix_id'))
 
     result = await send_model_management_request(request, url_idx, 'load', 'POST', payload, user=user)
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
     return result
 
 
@@ -1024,7 +937,7 @@ async def unload_provider_model(
     payload['model'] = strip_provider_model_prefix(payload['model'], api_config.get('prefix_id'))
 
     result = await send_model_management_request(request, url_idx, 'unload', 'POST', payload, user=user)
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
     return result
 
 
@@ -1051,7 +964,7 @@ async def delete_provider_model(
         query={'model': actual_model},
         user=user,
     )
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
     await publish_event(
         request,
         EVENTS.MODEL_PROVIDER_MODEL_DELETED,
@@ -1198,7 +1111,8 @@ def get_azure_allowed_params(api_version: str) -> set[str]:
 
 
 def is_openai_new_model(model: str) -> bool:
-    model_lower = model.lower()
+    # Amazon Bedrock ids carry a provider prefix, e.g. us.openai.gpt-6-sol
+    model_lower = re.sub(r'^(?:[a-z-]+\.)?openai\.', '', model.lower())
     # o-series models (o1, o3, o4, o5, ...)
     if re.match(r'^o\d+', model_lower):
         return True
@@ -1673,17 +1587,13 @@ async def generate_chat_completion(
             timeout=get_client_timeout(stream=is_streaming_request),
         )
 
-        # Error responses keep the upstream Retry-After (e.g. a gateway answering
-        # 503 while the model loads) so clients can back off without parsing
-        # the body. Other upstream headers are not forwarded on errors.
-        error_headers = _retry_after_headers(r.headers)
-
         # Check if response is SSE
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             # If the provider returned an error status with SSE content-type,
             # read the body and return a proper error response instead of
             # streaming the error back (which hides the error from logs).
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 error_body = await r.text()
                 log.error(
                     'Provider returned HTTP %d with SSE content-type: %s',
@@ -1702,7 +1612,7 @@ async def generate_chat_completion(
                         requested_model=requested_model,
                         upstream_error=error_json,
                     )
-                    return JSONResponse(status_code=r.status, content=error_json, headers=error_headers)
+                    return JSONResponse(status_code=r.status, content=error_json, headers=retry_headers)
                 except JSONCodec.JSONDecodeError:
                     await publish_model_provider_request_failed(
                         request,
@@ -1717,7 +1627,7 @@ async def generate_chat_completion(
                     return JSONResponse(
                         status_code=r.status,
                         content={'error': {'message': error_body, 'code': r.status}},
-                        headers=error_headers,
+                        headers=retry_headers,
                     )
 
             streaming = True
@@ -1734,6 +1644,7 @@ async def generate_chat_completion(
                 response = await r.text()
 
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,
@@ -1745,9 +1656,9 @@ async def generate_chat_completion(
                     upstream_error=response,
                 )
                 if isinstance(response, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response, headers=error_headers)
+                    return JSONResponse(status_code=r.status, content=response, headers=retry_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response, headers=error_headers)
+                    return PlainTextResponse(status_code=r.status, content=response, headers=retry_headers)
 
             # Convert Responses API result to simple format
             if is_responses and isinstance(response, dict):
@@ -1787,7 +1698,7 @@ async def completions(
     Returns the upstream response unchanged: a ``dict`` for non-streaming
     requests, a :class:`StreamingResponse` for SSE, or a ``JSONResponse`` /
     ``PlainTextResponse`` carrying the upstream error status (and its
-    ``Retry-After`` header, if any). Providers that do
+    ``Retry-After`` / ``Retry-After-MS`` headers, if any). Providers that do
     not expose a ``/completions`` route surface as a ``404``/``405`` response,
     which the public ``/api/completions`` handler uses to fall back to a chat
     completions conversion.
@@ -1894,16 +1805,13 @@ async def completions(
         # not reported as provider failures (every IDE autocomplete request on a
         # chat-only backend would otherwise emit a warning and an event).
         is_fallback_status = r.status in (404, 405)
-        # Error responses keep the upstream Retry-After (e.g. a gateway answering
-        # 503 while the model loads) so IDE clients can back off without parsing
-        # the body. Other upstream headers are not forwarded on errors.
-        error_headers = _retry_after_headers(r.headers)
 
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             # If the provider returned an error status with SSE content-type,
             # read the body and return a proper error response instead of
             # streaming the error back (which hides the error from logs).
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 error_body = await r.text()
                 if not is_fallback_status:
                     log.error(
@@ -1928,11 +1836,11 @@ async def completions(
                         upstream_error=error_json if error_json is not None else error_body,
                     )
                 if error_json is not None:
-                    return JSONResponse(status_code=r.status, content=error_json, headers=error_headers)
+                    return JSONResponse(status_code=r.status, content=error_json, headers=retry_headers)
                 return JSONResponse(
                     status_code=r.status,
                     content={'error': {'message': error_body, 'code': r.status}},
-                    headers=error_headers,
+                    headers=retry_headers,
                 )
 
             streaming = True
@@ -1948,6 +1856,7 @@ async def completions(
                 response_data = await r.text()
 
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 if not is_fallback_status:
                     await publish_model_provider_request_failed(
                         request,
@@ -1960,9 +1869,9 @@ async def completions(
                         upstream_error=response_data,
                     )
                 if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data, headers=error_headers)
+                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data, headers=error_headers)
+                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
 
             return response_data
     except Exception as e:
@@ -2055,6 +1964,7 @@ async def embeddings(request: Request, form_data: dict, user):
                 response_data = await r.text()
 
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,
@@ -2066,9 +1976,9 @@ async def embeddings(request: Request, form_data: dict, user):
                     upstream_error=response_data,
                 )
                 if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data)
+                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data)
+                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
 
             return response_data
     except Exception as e:
@@ -2183,6 +2093,7 @@ async def responses(
                 response_data = await r.text()
 
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,
@@ -2194,9 +2105,9 @@ async def responses(
                     upstream_error=response_data,
                 )
                 if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data)
+                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data)
+                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
 
             return response_data
 
@@ -2305,6 +2216,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
                 response_data = await r.text()
 
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,
@@ -2316,9 +2228,9 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
                     upstream_error=response_data,
                 )
                 if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data)
+                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data)
+                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
 
             return response_data
 

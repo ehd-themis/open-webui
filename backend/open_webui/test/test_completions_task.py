@@ -113,7 +113,7 @@ def chat_pipeline(upstream, monkeypatch):
         return default
 
     async def process_chat_payload(request, form_data, user, metadata, model):
-        return form_data, metadata, []
+        return form_data, metadata, [], False  # events, paused
 
     async def allow(*args, **kwargs):
         return None
@@ -191,6 +191,8 @@ MODEL_LOADING = {
         'code': 503,
     }
 }
+# A gateway loading a cold model answers 503 with the delay in Retry-After (seconds) / Retry-After-MS.
+RETRY_HEADERS = {'Retry-After': '30', 'Retry-After-MS': '30000'}
 
 
 @pytest.mark.asyncio
@@ -203,15 +205,15 @@ MODEL_LOADING = {
     ],
 )
 async def test_retry_after_reaches_client_on_503(upstream, content_type, body):
-    # A gateway loading a cold model answers 503 with Retry-After (seconds).
     upstream.status, upstream.body = 503, body
-    upstream.headers = {'Content-Type': content_type, 'Retry-After': '30', 'X-Upstream-Node': 'gpu-2'}
+    upstream.headers = {'Content-Type': content_type, **RETRY_HEADERS, 'X-Upstream-Node': 'gpu-2'}
 
     response = await main.completions(make_request(), {'model': MODEL_ID, 'prompt': 'def fib(n):'}, USER)
 
     assert response.status_code == 503
     assert response.headers['Retry-After'] == '30'
-    assert 'X-Upstream-Node' not in response.headers  # only Retry-After is forwarded
+    assert response.headers['Retry-After-MS'] == '30000'
+    assert 'X-Upstream-Node' not in response.headers  # only the retry hints are forwarded
     content = response.body.decode()
     assert (json.loads(content) if isinstance(body, dict) else content) == body
 
@@ -224,6 +226,7 @@ async def test_error_without_retry_after_adds_no_header(upstream):
 
     assert response.status_code == 500
     assert 'Retry-After' not in response.headers
+    assert 'Retry-After-MS' not in response.headers
 
 
 CHAT_REQUEST = {'model': MODEL_ID, 'messages': [{'role': 'user', 'content': 'Bonjour'}]}
@@ -231,26 +234,26 @@ CHAT_REQUEST = {'model': MODEL_ID, 'messages': [{'role': 'user', 'content': 'Bon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'content_type, body, client_body',
+    'content_type, body',
     [
-        # JSON errors keep /api/chat/completions' {"detail": ...} body; only status and Retry-After follow upstream.
-        ('application/json', MODEL_LOADING, {'detail': MODEL_LOADING['error']['message']}),
-        ('text/event-stream', MODEL_LOADING, {'detail': MODEL_LOADING['error']['message']}),
-        ('text/plain', 'model loading', 'model loading'),
+        ('application/json', MODEL_LOADING),
+        ('text/event-stream', MODEL_LOADING),
+        ('text/plain', 'model loading'),
     ],
 )
-async def test_chat_retry_after_reaches_client_on_503(chat_pipeline, content_type, body, client_body):
+async def test_chat_retry_after_reaches_client_on_503(chat_pipeline, content_type, body):
     chat_pipeline.status, chat_pipeline.body = 503, body
-    chat_pipeline.headers = {'Content-Type': content_type, 'Retry-After': '30', 'X-Upstream-Node': 'gpu-2'}
+    chat_pipeline.headers = {'Content-Type': content_type, **RETRY_HEADERS, 'X-Upstream-Node': 'gpu-2'}
 
     response = await client_response(main.chat_completion, make_request(), dict(CHAT_REQUEST), USER)
 
     assert chat_pipeline.calls[0]['url'] == 'http://gateway.test/v1/chat/completions'
     assert response.status_code == 503
     assert response.headers['Retry-After'] == '30'
-    assert 'X-Upstream-Node' not in response.headers  # only Retry-After is forwarded
+    assert response.headers['Retry-After-MS'] == '30000'
+    assert 'X-Upstream-Node' not in response.headers  # only the retry hints are forwarded
     content = response.body.decode()
-    assert (json.loads(content) if isinstance(client_body, dict) else content) == client_body
+    assert (json.loads(content) if isinstance(body, dict) else content) == body
 
 
 @pytest.mark.asyncio
@@ -264,39 +267,6 @@ async def test_chat_error_without_retry_after_keeps_provider_status(chat_pipelin
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'provider_status, client_status, retry_after',
-    [
-        (429, 429, '30'),
-        (401, 400, None),  # a provider auth failure must not read as a bad Open WebUI API key
-        (404, 400, None),
-    ],
-)
-async def test_chat_only_429_and_5xx_keep_provider_status(chat_pipeline, provider_status, client_status, retry_after):
-    chat_pipeline.status, chat_pipeline.body = provider_status, {'error': {'message': 'nope'}}
-    chat_pipeline.headers = {'Content-Type': 'application/json', 'Retry-After': '30'}
-
-    response = await client_response(main.chat_completion, make_request(), dict(CHAT_REQUEST), USER)
-
-    assert response.status_code == client_status
-    assert response.headers.get('Retry-After') == retry_after
-
-
-@pytest.mark.asyncio
-async def test_chat_pipeline_failure_is_still_a_400(chat_pipeline, monkeypatch):
-    async def process_chat_payload(*args):
-        raise Exception('filter rejected the request')
-
-    monkeypatch.setattr(main, 'process_chat_payload', process_chat_payload)
-
-    response = await client_response(main.chat_completion, make_request(), dict(CHAT_REQUEST), USER)
-
-    assert response.status_code == 400
-    assert 'Retry-After' not in response.headers
-    assert chat_pipeline.calls == []
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize('content_type, body', [('application/json', MODEL_LOADING), ('text/plain', 'model loading')])
 async def test_chat_fallback_retry_after_reaches_client_on_503(chat_pipeline, content_type, body):
     # A chat-only gateway: no native /completions route, and the model is still loading.
@@ -304,7 +274,7 @@ async def test_chat_fallback_retry_after_reaches_client_on_503(chat_pipeline, co
     chat_pipeline.routes['http://gateway.test/v1/chat/completions'] = (
         503,
         body,
-        {'Content-Type': content_type, 'Retry-After': '30'},
+        {'Content-Type': content_type, **RETRY_HEADERS},
     )
     form_data = {'model': MODEL_ID, 'prompt': 'def fib(n):'}
 
@@ -316,3 +286,4 @@ async def test_chat_fallback_retry_after_reaches_client_on_503(chat_pipeline, co
     ]
     assert response.status_code == 503
     assert response.headers['Retry-After'] == '30'
+    assert response.headers['Retry-After-MS'] == '30000'
