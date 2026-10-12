@@ -1649,6 +1649,7 @@ async def chat_completion(
         )
 
     async def process_chat(request, form_data, user, metadata, model, tasks=None):
+        error_status, error_headers = status.HTTP_400_BAD_REQUEST, None
         try:
             ctx = None
             if metadata.get('assistant_message_id'):
@@ -1664,8 +1665,14 @@ async def chat_completion(
             # content-filter, quota exceeded), generate_chat_completion
             # returns a JSONResponse instead of raising.  Detect this and
             # raise so the except-block below emits a terminal
-            # chat:message:error, unblocking the frontend.
+            # chat:message:error, unblocking the frontend.  Direct API
+            # callers get the provider's 429/5xx status and Retry-After (e.g.
+            # a 503 while the model loads) so they can back off; other
+            # provider errors stay 400, since a provider 401/403 would read as
+            # a bad Open WebUI API key.
             if isinstance(response, JSONResponse) and response.status_code >= 400:
+                if response.status_code == 429 or response.status_code >= 500:
+                    error_status, error_headers = response.status_code, openai._retry_after_headers(response.headers)
                 raise Exception(get_response_error_detail(response))
 
             if ctx is None:
@@ -1721,8 +1728,9 @@ async def chat_completion(
                 # a proper HTTP response; without this the function would
                 # return None which FastAPI serializes as null.  #23924
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
+                    status_code=error_status,
                     detail=error_detail,
+                    headers=error_headers,
                 )
         finally:
             # Clean up MCP clients.  Each client is isolated so one

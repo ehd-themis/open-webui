@@ -1673,6 +1673,11 @@ async def generate_chat_completion(
             timeout=get_client_timeout(stream=is_streaming_request),
         )
 
+        # Error responses keep the upstream Retry-After (e.g. a gateway answering
+        # 503 while the model loads) so clients can back off without parsing
+        # the body. Other upstream headers are not forwarded on errors.
+        error_headers = _retry_after_headers(r.headers)
+
         # Check if response is SSE
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             # If the provider returned an error status with SSE content-type,
@@ -1697,7 +1702,7 @@ async def generate_chat_completion(
                         requested_model=requested_model,
                         upstream_error=error_json,
                     )
-                    return JSONResponse(status_code=r.status, content=error_json)
+                    return JSONResponse(status_code=r.status, content=error_json, headers=error_headers)
                 except JSONCodec.JSONDecodeError:
                     await publish_model_provider_request_failed(
                         request,
@@ -1712,6 +1717,7 @@ async def generate_chat_completion(
                     return JSONResponse(
                         status_code=r.status,
                         content={'error': {'message': error_body, 'code': r.status}},
+                        headers=error_headers,
                     )
 
             streaming = True
@@ -1739,9 +1745,9 @@ async def generate_chat_completion(
                     upstream_error=response,
                 )
                 if isinstance(response, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response)
+                    return JSONResponse(status_code=r.status, content=response, headers=error_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response)
+                    return PlainTextResponse(status_code=r.status, content=response, headers=error_headers)
 
             # Convert Responses API result to simple format
             if is_responses and isinstance(response, dict):

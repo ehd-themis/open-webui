@@ -9,7 +9,10 @@ from types import SimpleNamespace
 
 import open_webui.main as main
 import open_webui.routers.openai as openai_router
+import open_webui.utils.chat as chat_utils
 import pytest
+from fastapi import HTTPException
+from fastapi.exception_handlers import http_exception_handler
 from open_webui.utils.completions import COMPLETIONS_TASK, with_completions_task
 
 MODEL_ID = 'zeta-2.1'
@@ -40,20 +43,34 @@ class FakeSession:
         self.status = 200
         self.headers = {'Content-Type': 'application/json'}
         self.body = {'object': 'text_completion', 'choices': [{'text': ' return n'}]}
+        self.routes = {}  # url -> (status, body, headers), overriding the defaults above
         self.calls = []
 
     async def request(self, **kwargs):
         self.calls.append(kwargs)
-        return FakeResponse(self.status, self.body, self.headers)
+        return FakeResponse(*self.routes.get(kwargs['url'], (self.status, self.body, self.headers)))
 
 
 def make_request():
     return SimpleNamespace(
-        app=SimpleNamespace(state=SimpleNamespace(OPENAI_MODELS={MODEL_ID: {'urlIdx': 0}})),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                MODELS={MODEL_ID: {'id': MODEL_ID, 'owned_by': 'openai', 'urlIdx': 0}},
+                OPENAI_MODELS={MODEL_ID: {'urlIdx': 0}},
+            )
+        ),
         headers={},
         cookies={},
         state=SimpleNamespace(),
     )
+
+
+async def client_response(handler, *args):
+    """What the HTTP client gets: the handler's response, or FastAPI's rendering of the HTTPException it raised."""
+    try:
+        return await handler(*args)
+    except HTTPException as e:
+        return await http_exception_handler(None, e)
 
 
 @pytest.fixture
@@ -86,6 +103,27 @@ def upstream(monkeypatch):
     monkeypatch.setattr(openai_router, 'get_session', get_session)
     monkeypatch.setattr(openai_router, 'publish_model_provider_request_failed', publish_model_provider_request_failed)
     return session
+
+
+@pytest.fixture
+def chat_pipeline(upstream, monkeypatch):
+    """Runs the real /api/chat/completions handler against ``upstream``, minus the DB-backed lookups."""
+
+    async def config_get(key, default=None):
+        return default
+
+    async def process_chat_payload(request, form_data, user, metadata, model):
+        return form_data, metadata, []
+
+    async def allow(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, 'Config', SimpleNamespace(get=config_get))
+    monkeypatch.setattr(main, 'Models', openai_router.Models)
+    monkeypatch.setattr(main, 'check_model_access', allow)
+    monkeypatch.setattr(main, 'process_chat_payload', process_chat_payload)
+    monkeypatch.setattr(chat_utils, 'check_model_access', allow)
+    return upstream
 
 
 def test_with_completions_task_defaults_to_autocomplete():
@@ -186,3 +224,95 @@ async def test_error_without_retry_after_adds_no_header(upstream):
 
     assert response.status_code == 500
     assert 'Retry-After' not in response.headers
+
+
+CHAT_REQUEST = {'model': MODEL_ID, 'messages': [{'role': 'user', 'content': 'Bonjour'}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'content_type, body, client_body',
+    [
+        # JSON errors keep /api/chat/completions' {"detail": ...} body; only status and Retry-After follow upstream.
+        ('application/json', MODEL_LOADING, {'detail': MODEL_LOADING['error']['message']}),
+        ('text/event-stream', MODEL_LOADING, {'detail': MODEL_LOADING['error']['message']}),
+        ('text/plain', 'model loading', 'model loading'),
+    ],
+)
+async def test_chat_retry_after_reaches_client_on_503(chat_pipeline, content_type, body, client_body):
+    chat_pipeline.status, chat_pipeline.body = 503, body
+    chat_pipeline.headers = {'Content-Type': content_type, 'Retry-After': '30', 'X-Upstream-Node': 'gpu-2'}
+
+    response = await client_response(main.chat_completion, make_request(), dict(CHAT_REQUEST), USER)
+
+    assert chat_pipeline.calls[0]['url'] == 'http://gateway.test/v1/chat/completions'
+    assert response.status_code == 503
+    assert response.headers['Retry-After'] == '30'
+    assert 'X-Upstream-Node' not in response.headers  # only Retry-After is forwarded
+    content = response.body.decode()
+    assert (json.loads(content) if isinstance(client_body, dict) else content) == client_body
+
+
+@pytest.mark.asyncio
+async def test_chat_error_without_retry_after_keeps_provider_status(chat_pipeline):
+    chat_pipeline.status, chat_pipeline.body = 500, {'error': {'message': 'boom'}}
+
+    response = await client_response(main.chat_completion, make_request(), dict(CHAT_REQUEST), USER)
+
+    assert response.status_code == 500
+    assert 'Retry-After' not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'provider_status, client_status, retry_after',
+    [
+        (429, 429, '30'),
+        (401, 400, None),  # a provider auth failure must not read as a bad Open WebUI API key
+        (404, 400, None),
+    ],
+)
+async def test_chat_only_429_and_5xx_keep_provider_status(chat_pipeline, provider_status, client_status, retry_after):
+    chat_pipeline.status, chat_pipeline.body = provider_status, {'error': {'message': 'nope'}}
+    chat_pipeline.headers = {'Content-Type': 'application/json', 'Retry-After': '30'}
+
+    response = await client_response(main.chat_completion, make_request(), dict(CHAT_REQUEST), USER)
+
+    assert response.status_code == client_status
+    assert response.headers.get('Retry-After') == retry_after
+
+
+@pytest.mark.asyncio
+async def test_chat_pipeline_failure_is_still_a_400(chat_pipeline, monkeypatch):
+    async def process_chat_payload(*args):
+        raise Exception('filter rejected the request')
+
+    monkeypatch.setattr(main, 'process_chat_payload', process_chat_payload)
+
+    response = await client_response(main.chat_completion, make_request(), dict(CHAT_REQUEST), USER)
+
+    assert response.status_code == 400
+    assert 'Retry-After' not in response.headers
+    assert chat_pipeline.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('content_type, body', [('application/json', MODEL_LOADING), ('text/plain', 'model loading')])
+async def test_chat_fallback_retry_after_reaches_client_on_503(chat_pipeline, content_type, body):
+    # A chat-only gateway: no native /completions route, and the model is still loading.
+    chat_pipeline.status, chat_pipeline.body = 404, {'error': 'not found'}
+    chat_pipeline.routes['http://gateway.test/v1/chat/completions'] = (
+        503,
+        body,
+        {'Content-Type': content_type, 'Retry-After': '30'},
+    )
+    form_data = {'model': MODEL_ID, 'prompt': 'def fib(n):'}
+
+    response = await client_response(main.completions, make_request(), form_data, USER)
+
+    assert [call['url'] for call in chat_pipeline.calls] == [
+        'http://gateway.test/v1/completions',
+        'http://gateway.test/v1/chat/completions',
+    ]
+    assert response.status_code == 503
+    assert response.headers['Retry-After'] == '30'
