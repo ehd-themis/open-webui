@@ -31,6 +31,9 @@ log = logging.getLogger(__name__)
 
 BASE_MODELS_CACHE_KEY = f'{REDIS_KEY_PREFIX}:models:base'
 
+# Base-model limits a preset (a custom model with a base_model_id) reports as its own.
+PRESET_INHERITED_LIMITS = ('context_length', 'max_model_len')
+
 
 def public_model_params(params):
     controls = params.get('model_controls', {})
@@ -265,6 +268,13 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
                 **({'pipe': pipe} if pipe is not None else {}),
                 **({'provider': base_model.get('provider')} if base_model and base_model.get('provider') else {}),
                 **({'loaded': base_model.get('loaded')} if base_model and base_model.get('loaded') is not None else {}),
+                # A preset runs on its base model, so it has the same context window: clients that
+                # size prompts from /models (context_length, vLLM's max_model_len) see it too.
+                **{
+                    key: base_model[key]
+                    for key in PRESET_INHERITED_LIMITS
+                    if base_model and base_model.get(key) is not None
+                },
             }
 
             info = custom_model.model_dump()
