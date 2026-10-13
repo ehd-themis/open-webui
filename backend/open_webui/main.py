@@ -1094,6 +1094,20 @@ async def unload_model(request: Request, form_data: ModelUnloadForm, user=Depend
     raise HTTPException(status_code=404, detail=f'Model "{model_id}" not found')
 
 
+# Registered after /api/models/base and after the /api/v1/models router, so their fixed paths win.
+@app.get('/api/models/{model_id:path}')
+@app.get('/api/v1/models/{model_id:path}')  # Experimental: Compatibility with OpenAI API
+async def get_model(request: Request, model_id: str, user=Depends(get_verified_user)):
+    """
+    OpenAI "retrieve model": one entry of /api/models. Clients such as Visual Studio's
+    Copilot check a model this way before adding it.
+    """
+    for model in (await get_models(request, user=user))['data']:
+        if model['id'] == model_id:
+            return model
+    raise HTTPException(status_code=404, detail=f'Model "{model_id}" not found')
+
+
 ##################################
 # Embeddings
 ##################################
