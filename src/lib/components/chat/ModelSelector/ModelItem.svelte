@@ -17,6 +17,7 @@
 	import { toast } from 'svelte-sonner';
 	import Tag from '$lib/components/icons/Tag.svelte';
 	import Label from '$lib/components/icons/Label.svelte';
+	import ModelStateChip from './ModelStateChip.svelte';
 
 	const i18n = getContext<typeof import('$lib/i18n').default>('i18n');
 
@@ -121,6 +122,7 @@
 			</div>
 
 			<div class="flex shrink-0 items-center gap-1.5">
+				<ModelStateChip model={item.model} />
 				{#if item.model.owned_by === 'ollama'}
 					{#if (item.model.ollama?.details?.parameter_size ?? '') !== ''}
 						<div class="flex items-center translate-y-[0.5px]">

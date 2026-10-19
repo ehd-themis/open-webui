@@ -11,7 +11,7 @@
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import { flyAndScale } from '$lib/utils/transitions';
 
-	import { createEventDispatcher, onMount, getContext, tick } from 'svelte';
+	import { createEventDispatcher, onDestroy, onMount, getContext, tick } from 'svelte';
 
 	import { deleteModel, getOllamaVersion, pullModel } from '$lib/apis/ollama';
 	import { deleteModelById } from '$lib/apis/models';
@@ -40,6 +40,8 @@
 		resolveLocalizedModelName
 	} from '$lib/utils/localizedContent';
 	import { getModels } from '$lib/apis';
+	import ModelStateChip from './ModelStateChip.svelte';
+	import { getModelAvailability } from '$lib/utils/modelAvailability';
 
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
 	import Check from '$lib/components/icons/Check.svelte';
@@ -732,6 +734,26 @@
 			: [];
 	};
 
+	// A model that is starting or asleep changes on its own: look again every 15 s while it is the chosen one.
+	let refreshTimer: ReturnType<typeof setInterval> | undefined;
+	$: watching = !!selectedModel && ['starting', 'stopping'].includes(getModelAvailability(selectedModel.model)?.state ?? '');
+	$: {
+		if (watching && !refreshTimer) {
+			refreshTimer = setInterval(async () => {
+				models.set(
+					await getModels(
+						localStorage.token,
+						$config?.features?.enable_direct_connections && ($settings?.directConnections ?? null)
+					)
+				);
+			}, 15000);
+		} else if (!watching && refreshTimer) {
+			clearInterval(refreshTimer);
+			refreshTimer = undefined;
+		}
+	}
+	onDestroy(() => refreshTimer && clearInterval(refreshTimer));
+
 	onMount(() => {
 		if (items) {
 			tags = items
@@ -916,6 +938,7 @@
 			}}
 		>
 			<span class="min-w-0 flex-1 truncate">{triggerLabel}</span>
+			{#if selectedModel && !compareEnabled}<ModelStateChip model={selectedModel.model} mode="dot" />{/if}
 			<ChevronDown className="ml-1 size-2.5 shrink-0 self-center" strokeWidth="2.5" />
 		</div>
 	</button>
