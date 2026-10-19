@@ -4,13 +4,23 @@
  * Everything here is optional, so a model from any other connection simply shows nothing.
  */
 export type ModelAvailability =
-	| { state: 'ready' }
+	| { state: 'ready'; stopsAt?: number; stopsKind?: 'idle' | 'window' | 'override' }
 	| { state: 'starting'; etaMin: number }
 	| { state: 'asleep'; etaMin: number }
 	| { state: 'stopping' }
-	| { state: 'unavailable'; reason: string; until?: number };
+	| { state: 'unavailable'; reason: string; until?: number; startsAt?: number };
 
-type Raw = { state?: string; eta_min?: number; reason?: string; until?: number } | undefined;
+type Raw =
+	| {
+			state?: string;
+			eta_min?: number;
+			reason?: string;
+			until?: number;
+			starts_at?: number;
+			stops_at?: number;
+			stops_kind?: string;
+	  }
+	| undefined;
 
 /** Reads `lachesis` off a model object; falls back on the coarse `owned_by` (ready, starting, cold) older gateways send. */
 export const getModelAvailability = (model: any): ModelAvailability | null => {
@@ -18,8 +28,15 @@ export const getModelAvailability = (model: any): ModelAvailability | null => {
 	if (raw?.state) {
 		switch (raw.state) {
 			case 'ready':
+				return {
+					state: 'ready',
+					...(typeof raw.stops_at === 'number' &&
+					['idle', 'window', 'override'].includes(raw.stops_kind ?? '')
+						? { stopsAt: raw.stops_at, stopsKind: raw.stops_kind as 'idle' | 'window' | 'override' }
+						: {})
+				};
 			case 'stopping':
-				return { state: raw.state };
+				return { state: 'stopping' };
 			case 'starting':
 			case 'asleep':
 				return { state: raw.state, etaMin: Math.max(1, Math.round(raw.eta_min ?? 1)) };
@@ -27,7 +44,8 @@ export const getModelAvailability = (model: any): ModelAvailability | null => {
 				return {
 					state: 'unavailable',
 					reason: raw.reason ?? 'blocked',
-					...(typeof raw.until === 'number' ? { until: raw.until } : {})
+					...(typeof raw.until === 'number' ? { until: raw.until } : {}),
+					...(typeof raw.starts_at === 'number' ? { startsAt: raw.starts_at } : {})
 				};
 		}
 		return null;
