@@ -20,6 +20,7 @@ BASE_MODELS = [
         'connection_type': 'external',
         'context_length': 262144,
         'max_model_len': 262144,
+        'lachesis': {'state': 'asleep', 'eta_min': 6},
     },
     {'id': 'no-limits', 'name': 'no-limits', 'object': 'model', 'owned_by': 'openai'},
 ]
@@ -74,6 +75,8 @@ async def test_preset_reports_its_base_model_context(monkeypatch):
     assert models['qwen-thinking']['preset'] is True
     assert models['qwen-thinking']['context_length'] == 262144
     assert models['qwen-thinking']['max_model_len'] == 262144
+    # The gateway's availability follows too: a user who sees the preset may not see its base model.
+    assert models['qwen-thinking']['lachesis'] == {'state': 'asleep', 'eta_min': 6}
     # The base model keeps its own values.
     assert models[BASE_ID]['context_length'] == 262144
 
@@ -85,3 +88,4 @@ async def test_preset_without_known_limits_gets_no_keys(monkeypatch):
     for model_id in ('plain', 'orphan'):
         assert 'context_length' not in models[model_id]
         assert 'max_model_len' not in models[model_id]
+        assert 'lachesis' not in models[model_id]

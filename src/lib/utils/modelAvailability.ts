@@ -22,8 +22,26 @@ type Raw =
 	  }
 	| undefined;
 
+/**
+ * The availability of a model, as shown to the user. A workspace preset ("sub-model", `info.base_model_id`)
+ * carries no gateway field of its own: it is served by its base model, so the base's state is the preset's
+ * (followed up the chain, a few hops at most). `all` is the list of models the user can see.
+ */
+export const getModelAvailability = (model: any, all: any[] = []): ModelAvailability | null => {
+	let current = model;
+	for (let hop = 0; hop < 5 && current; hop++) {
+		const found = readAvailability(current);
+		if (found) return found;
+		const baseId = current?.info?.base_model_id;
+		if (!baseId) return null;
+		current =
+			all.find((m) => m?.id === baseId) ?? all.find((m) => m?.id === String(baseId).split(':')[0]);
+	}
+	return null;
+};
+
 /** Reads `lachesis` off a model object; falls back on the coarse `owned_by` (ready, starting, cold) older gateways send. */
-export const getModelAvailability = (model: any): ModelAvailability | null => {
+const readAvailability = (model: any): ModelAvailability | null => {
 	const raw: Raw = model?.openai?.lachesis ?? model?.lachesis;
 	if (raw?.state) {
 		switch (raw.state) {
