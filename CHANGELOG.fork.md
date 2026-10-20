@@ -7,6 +7,7 @@ Changes made in the ehd-themis fork on top of upstream Open WebUI. Upstream's re
 
 ### Added
 
+- 🔁 **A long tool run ends with an answer, and a looping one is stopped early.** When a reply reaches the tool-call limit (`CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS`), the last completion is sent without tools and with a note asking the model to summarise what it found and say what is left, instead of the chat ending on a "limit reached" error; the user can reply "continue" to carry on. A new `CHAT_RESPONSE_TOOL_CALL_REPEAT_LIMIT` (default 3, 0 to turn off) adds a warning to the result when the same tool is called with the same arguments that many iterations in a row, and takes the tools away two repeats later.
 - 🚦 **The model selector shows whether the AI is ready before a message is sent.** A dot beside each model (and on the selector button) reads the `lachesis` field the gateway puts on its `/v1/models` entries, which Open WebUI already passes through under `model.openai`: ready (with the estimated stop time), starting (minutes left), asleep (the first message starts it), stopped or unavailable. The list refreshes every 15 s while the chosen model is starting. Models without the field, or from other connections, show nothing.
 
 ### Changed
