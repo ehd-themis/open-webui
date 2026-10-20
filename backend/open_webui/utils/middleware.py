@@ -35,6 +35,7 @@ from open_webui.env import (
     BYPASS_MODEL_ACCESS_CONTROL,
     CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS,
     CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE,
+    CHAT_RESPONSE_TOOL_CALL_REPEAT_LIMIT,
     ENABLE_API_OUTLET_FILTERS,
     ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION,
     ENABLE_CHAT_RESPONSE_STREAM_INPLACE_APPEND,
@@ -5558,6 +5559,8 @@ async def streaming_chat_response_handler(response, ctx):
                     'max_tool_call_iterations',
                     CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS,
                 )
+                tool_call_repeat_streaks = {}  # (tool, arguments) -> consecutive iterations it was called
+                tool_call_repeat_exhausted = False
                 tool_call_sources = []  # Track citation sources from tool results
                 all_tool_call_sources = []  # Accumulated sources across all iterations
                 user_message = get_last_user_message(form_data['messages'])
@@ -5726,10 +5729,18 @@ async def streaming_chat_response_handler(response, ctx):
                         )
                     )
 
+                    previous_repeat_streaks, tool_call_repeat_streaks = tool_call_repeat_streaks, {}
                     for tool_call in response_tool_calls:
                         tool_call_id = tool_call.get('id', '')
                         tool_function_name = tool_call.get('function', {}).get('name', '')
                         tool_function_params, tool_result, tool, tool_type, direct_tool = tool_results[id(tool_call)]
+                        repeat_signature = (
+                            tool_function_name,
+                            json.dumps(tool_function_params, sort_keys=True, default=str),
+                        )
+                        tool_call_repeat_streaks[repeat_signature] = (
+                            previous_repeat_streaks.get(repeat_signature, 0) + 1
+                        )
                         if tool_result is None:
                             results.append(
                                 {
@@ -5782,10 +5793,22 @@ async def streaming_chat_response_handler(response, ctx):
                             except Exception as e:
                                 log.exception(f'Error extracting citation source: {e}')
 
+                        tool_result_text = tool_result_content(tool_result)
+                        repeat_streak = tool_call_repeat_streaks[repeat_signature]
+                        repeat_limit = CHAT_RESPONSE_TOOL_CALL_REPEAT_LIMIT
+                        if repeat_limit and repeat_streak >= repeat_limit:
+                            tool_result_text += (
+                                f'\n\n[Notice: this exact call to `{tool_function_name}` has now been made '
+                                f'{repeat_streak} times in a row. Repeating it will not give a different result. '
+                                'Use what you already have, or try a different approach.]'
+                            )
+                            if repeat_streak >= repeat_limit + 2:
+                                tool_call_repeat_exhausted = True
+
                         results.append(
                             {
                                 'tool_call_id': tool_call_id,
-                                'content': tool_result_content(tool_result),
+                                'content': tool_result_text,
                                 **({'files': tool_result_files} if tool_result_files else {}),
                                 **({'embeds': tool_result_embeds} if tool_result_embeds else {}),
                             }
@@ -6033,6 +6056,29 @@ async def streaming_chat_response_handler(response, ctx):
                             )
 
                         new_form_data = normalize_messages_for_model(new_form_data)
+
+                        # Fork: when the tool budget is spent or the model is going in circles, take the tools
+                        # away for this last completion so it concludes in text instead of the chat ending on
+                        # a "limit reached" error.
+                        wrap_up_notice = None
+                        if tool_call_repeat_exhausted:
+                            wrap_up_notice = (
+                                'You have been repeating the same tool call without progress, so tools are '
+                                'switched off. Answer now with what you found and say what is still missing.'
+                            )
+                        elif max_tool_call_iterations is not None and tool_call_iterations >= max_tool_call_iterations:
+                            wrap_up_notice = (
+                                f'The limit of {max_tool_call_iterations} tool-call rounds for this reply has been '
+                                'reached, so tools are switched off. Answer now with what you found, say what is '
+                                'still unfinished and that the user can reply "continue" to carry on.'
+                            )
+                        if wrap_up_notice:
+                            new_form_data.pop('tools', None)
+                            new_form_data.pop('tool_choice', None)
+                            new_form_data['messages'] = [
+                                *new_form_data['messages'],
+                                {'role': 'user', 'content': f'[System notice] {wrap_up_notice}'},
+                            ]
 
                         res = await generate_chat_completion(
                             request,

@@ -1106,6 +1106,15 @@ if CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS == -1:
     CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS = None
 
 
+# Fork: how many consecutive iterations may repeat the exact same tool call (same tool, same
+# arguments) before the result carries a warning telling the model to stop. Two more repeats
+# take the tools away so the model has to answer. 0 turns the guard off.
+try:
+    CHAT_RESPONSE_TOOL_CALL_REPEAT_LIMIT = max(0, int(os.getenv('CHAT_RESPONSE_TOOL_CALL_REPEAT_LIMIT', '3') or 3))
+except ValueError:
+    CHAT_RESPONSE_TOOL_CALL_REPEAT_LIMIT = 3
+
+
 # WARNING: Experimental. Only enable if your upstream Responses API endpoint
 # supports stateful sessions (i.e. server-side response storage with
 # previous_response_id anchoring). Most proxies and third-party endpoints
