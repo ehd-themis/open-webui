@@ -736,7 +736,7 @@
 
 	// A model that is starting or asleep changes on its own: look again every 15 s while it is the chosen one.
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
-	$: watching = !!selectedModel && ['starting', 'stopping'].includes(getModelAvailability(selectedModel.model)?.state ?? '');
+	$: watching = !!selectedModel && ['starting', 'stopping'].includes(getModelAvailability(selectedModel.model, $models)?.state ?? '');
 	$: {
 		if (watching && !refreshTimer) {
 			refreshTimer = setInterval(async () => {

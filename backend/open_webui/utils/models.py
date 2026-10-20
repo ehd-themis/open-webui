@@ -31,8 +31,10 @@ log = logging.getLogger(__name__)
 
 BASE_MODELS_CACHE_KEY = f'{REDIS_KEY_PREFIX}:models:base'
 
-# Base-model limits a preset (a custom model with a base_model_id) reports as its own.
-PRESET_INHERITED_LIMITS = ('context_length', 'max_model_len')
+# Base-model limits a preset (a custom model with a base_model_id) reports as its own, and the gateway's
+# availability field (`lachesis`: ready / starting / asleep ..., see the model selector's state chip): a preset
+# is served by its base model, and a user who can see the preset may not be able to see the base.
+PRESET_INHERITED_LIMITS = ('context_length', 'max_model_len', 'lachesis')
 
 
 def public_model_params(params):

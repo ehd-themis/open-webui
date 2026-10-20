@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
+	import { models } from '$lib/stores';
 	import { availabilityDot, getModelAvailability } from '$lib/utils/modelAvailability';
 
 	const i18n = getContext<typeof import('$lib/i18n').default>('i18n');
@@ -9,7 +10,7 @@
 	/** `dot`: the colour only, with the sentence in a tooltip. `text`: the short sentence too. */
 	export let mode: 'dot' | 'text' = 'text';
 
-	$: availability = getModelAvailability(model);
+	$: availability = getModelAvailability(model, $models);
 
 	/** `14:35` today, `Fri 08:00` another day, in the reader's own time zone. */
 	const when = (epochSec: number) => {
