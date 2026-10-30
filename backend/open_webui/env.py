@@ -1153,6 +1153,15 @@ except ValueError:
     CHAT_RESPONSE_TOOL_CALL_REPEAT_LIMIT = 3
 
 
+# Fork: the most characters of one tool result that are sent back to the model. A longer result is
+# cut with a note, and long base64 (a downloaded file) is replaced with a marker whatever the limit
+# (see utils/tool_output_limit.py). 0 turns the cut off.
+try:
+    CHAT_RESPONSE_TOOL_RESULT_MAX_CHARS = int(os.getenv('CHAT_RESPONSE_TOOL_RESULT_MAX_CHARS', '30000') or 30000)
+except ValueError:
+    CHAT_RESPONSE_TOOL_RESULT_MAX_CHARS = 30000
+
+
 # WARNING: Experimental. Only enable if your upstream Responses API endpoint
 # supports stateful sessions (i.e. server-side response storage with
 # previous_response_id anchoring). Most proxies and third-party endpoints

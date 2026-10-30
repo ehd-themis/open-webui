@@ -127,6 +127,7 @@ from open_webui.utils.misc import (
     set_last_user_message_content,
     strip_empty_content_blocks,
 )
+from open_webui.utils.tool_output_limit import replace_base64_blobs
 from open_webui.utils.oauth import get_system_oauth_token
 from open_webui.utils.payload import apply_params_to_form_data, apply_system_prompt_to_body, resolve_system_prompt
 from open_webui.utils.plugin import load_function_module_by_id
@@ -939,6 +940,11 @@ async def process_tool_result(
             tool_result = json.dumps(tool_result[0], indent=2, ensure_ascii=False) if len(tool_result) > 0 else ''
         else:
             tool_result = str(tool_result)
+
+    # Keep downloaded files (long base64) out of the stored result; the cut to a length happens when
+    # the model's messages are built, so the full text stays visible in the chat.
+    if isinstance(tool_result, str):
+        tool_result = replace_base64_blobs(tool_result)
 
     return tool_result, tool_result_files, tool_result_embeds
 
