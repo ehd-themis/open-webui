@@ -19,7 +19,7 @@ from open_webui.env import CHAT_RESPONSE_TOOL_RESULT_MAX_CHARS
 
 # Shorter runs are left alone: they are more likely to be an identifier than a file.
 BASE64_BLOB_MIN_LENGTH = 1000
-BASE64_BLOB_RE = re.compile(r'[A-Za-z0-9+/]{%d,}={0,2}' % BASE64_BLOB_MIN_LENGTH)
+BASE64_BLOB_RE = re.compile(rf'[A-Za-z0-9+/]{{{BASE64_BLOB_MIN_LENGTH},}}={{0,2}}')
 
 # Leading base64 of well-known file formats.
 BASE64_SIGNATURES = (
