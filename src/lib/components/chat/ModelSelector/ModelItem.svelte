@@ -76,6 +76,9 @@
 		: ''}"
 	data-arrow-selected={index === selectedModelIdx}
 	data-value={item.value}
+	on:focus={() => {
+		selectedModelIdx = index;
+	}}
 	on:click={() => {
 		onClick();
 	}}
