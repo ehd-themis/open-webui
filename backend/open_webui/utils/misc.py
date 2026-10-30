@@ -17,6 +17,7 @@ import aiohttp
 import mimeparse
 from open_webui.env import CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE
 from open_webui.utils.json_codec import JSONCodec
+from open_webui.utils.tool_output_limit import limit_tool_output
 
 log = logging.getLogger(__name__)
 SURROGATE_RE = re.compile('[\ud800-\udfff]')
@@ -455,6 +456,8 @@ def convert_output_to_messages(
                     url = part.get('image_url', '')
                     if url:
                         image_urls.append(url)
+
+            content = limit_tool_output(content)
 
             if flatten_tool_images:
                 messages.append(
