@@ -21,7 +21,7 @@ jobs:
       contents: write
       actions: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5.1.0
 
       - name: Abort if package.json unchanged
         run: |
@@ -68,7 +68,7 @@ jobs:
           fi
 
       - name: Archive source
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: release-archive
           path: |
@@ -81,7 +81,7 @@ jobs:
       # dispatching on an old tag runs that tag's (possibly outdated) docker.yaml
       - name: Trigger Docker build
         if: steps.release.outputs.created == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v8.0.0
         with:
           script: |
             github.rest.actions.createWorkflowDispatch({
