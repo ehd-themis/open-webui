@@ -2258,6 +2258,78 @@ async def completions(
     return response
 
 
+##################################
+#
+# OpenAI Responses API Compatible Endpoint
+#
+##################################
+
+
+from open_webui.utils.responses_compat import (
+    ResponsesRequestError,
+    chat_response_to_stream,
+    chat_stream_to_responses_stream,
+    convert_chat_to_responses_response,
+    convert_responses_to_chat_payload,
+)
+
+
+@app.post('/api/responses')
+@app.post('/api/v1/responses')  # Experimental: Compatibility with OpenAI API (e.g. Codex)
+async def responses(
+    request: Request,
+    form_data: dict,
+    user=Depends(get_verified_user),
+):
+    """
+    OpenAI Responses API compatible endpoint.
+
+    Accepts the Responses API format (``input``, ``instructions``, ``tools``,
+    ...), converts it to Chat Completions, routes it through the existing chat
+    completion pipeline (presets, access control, task headers) and converts the
+    result back to a Responses object or event stream. Works with chat-only
+    backends. Stateless: ``previous_response_id`` is rejected.
+    """
+    requested_model = form_data.get('model', '')
+    request.state.model_id = requested_model
+
+    try:
+        chat_payload, custom_tools = convert_responses_to_chat_payload(form_data)
+    except ResponsesRequestError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    response = await chat_completion(request, chat_payload, user)
+
+    stream_headers = {'Cache-Control': 'no-cache', 'Connection': 'keep-alive'}
+
+    if isinstance(response, StreamingResponse):
+        return StreamingResponse(
+            chat_stream_to_responses_stream(response.body_iterator, model=requested_model, custom_tools=custom_tools),
+            media_type='text/event-stream',
+            headers=stream_headers,
+        )
+    elif isinstance(response, dict) and response.get('error'):
+        # A pipe function or an upstream answered 200 with an error body.
+        error = response['error']
+        message = error.get('message') if isinstance(error, dict) else str(error)
+        raise HTTPException(status_code=502, detail=message or 'Upstream error')
+    elif isinstance(response, dict) and chat_payload.get('stream'):
+        # The client asked for a stream but the pipeline answered with plain JSON
+        # (stream_response is off for the model, or the upstream ignored `stream`).
+        return StreamingResponse(
+            chat_stream_to_responses_stream(
+                chat_response_to_stream(response), model=requested_model, custom_tools=custom_tools
+            ),
+            media_type='text/event-stream',
+            headers=stream_headers,
+        )
+    elif isinstance(response, dict):
+        return convert_chat_to_responses_response(response, model=requested_model, custom_tools=custom_tools)
+    else:
+        # Passthrough for error responses (JSONResponse, PlainTextResponse, etc.)
+        return response
+
+
 async def verify_chat_ownership(chat_id: str | None, user) -> None:
     """Temporary chats are per-socket and unsaved, so they have no owner to check."""
     if not chat_id or is_temporary_chat_id(chat_id):
