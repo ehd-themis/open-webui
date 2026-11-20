@@ -151,6 +151,7 @@ from open_webui.models.users import Users
 from open_webui.routers import (
     apps,
     analytics,
+    api_keys,
     audio,
     auths,
     automations,
@@ -831,6 +832,7 @@ from open_webui.routers import tether
 
 app.include_router(tether.router, prefix='/api/v1/tether', tags=['tether'])
 app.include_router(auths.router, prefix='/api/v1/auths', tags=['auths'])
+app.include_router(api_keys.router, prefix='/api/v1/api_keys', tags=['api_keys'])
 app.include_router(mfa.router, prefix='/api/v1/auths/mfa', tags=['auths'])
 app.include_router(users.router, prefix='/api/v1/users', tags=['users'])
 
