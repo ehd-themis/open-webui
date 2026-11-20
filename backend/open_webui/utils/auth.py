@@ -33,6 +33,7 @@ from open_webui.env import (
     WEBUI_SECRET_KEY,
     pk,
 )
+from open_webui.models.api_keys import ApiKeys
 from open_webui.models.auths import Auths
 from open_webui.models.config import Config
 from open_webui.models.users import Users
@@ -563,6 +564,7 @@ async def get_current_user_by_api_key(request, api_key: str):
             current_span.set_attribute('client.user.role', user.role)
             current_span.set_attribute('client.auth.type', 'api_key')
 
+    await ApiKeys.touch_last_used(api_key)
     await Users.update_last_active_by_id(user.id)
     return user
 

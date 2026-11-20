@@ -6,24 +6,15 @@
 
 	import { goto } from '$app/navigation';
 
-	import {
-		updateUserById,
-		getUserGroupsById,
-		revokeUserSessions,
-		rotateUserAPIKeyById,
-		deleteUserAPIKeyById
-	} from '$lib/apis/users';
-	import { copyToClipboard } from '$lib/utils';
+	import { updateUserById, getUserGroupsById, revokeUserSessions } from '$lib/apis/users';
 
 	import Modal from '$lib/components/common/Modal.svelte';
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	let showRevokeConfirmation = false;
-	let showDeleteAPIKeyConfirmation = false;
-	let showRotateAPIKeyConfirmation = false;
-	let rotatedAPIKey = '';
 	import localizedFormat from 'dayjs/plugin/localizedFormat';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import SensitiveInput from '$lib/components/common/SensitiveInput.svelte';
+	import ApiKeys from '$lib/components/common/ApiKeys.svelte';
 	import UserProfileImage from '$lib/components/chat/Settings/Account/UserProfileImage.svelte';
 
 	const i18n = getContext<typeof import('$lib/i18n').default>('i18n');
@@ -36,12 +27,9 @@
 
 	$: if (show && selectedUser) {
 		init();
-	} else {
-		rotatedAPIKey = '';
 	}
 
 	const init = () => {
-		rotatedAPIKey = '';
 		if (selectedUser) {
 			_user = { ...selectedUser, password: '' };
 			loadUserGroups();
@@ -79,42 +67,6 @@
 		});
 	};
 </script>
-
-<ConfirmDialog
-	bind:show={showRotateAPIKeyConfirmation}
-	title={$i18n.t('Rotate API Key?')}
-	message={$i18n.t(
-		'This will replace the current API key. Integrations using the old key will stop working.'
-	)}
-	confirmLabel={$i18n.t('Rotate')}
-	on:confirm={async () => {
-		const target = _user;
-		try {
-			const key = await rotateUserAPIKeyById(localStorage.token, selectedUser.id);
-			if (show && target === _user) rotatedAPIKey = key;
-			toast.success($i18n.t('API Key created.'));
-		} catch (error) {
-			toast.error(error instanceof Error ? error.message : String(error));
-		}
-	}}
-/>
-
-<ConfirmDialog
-	bind:show={showDeleteAPIKeyConfirmation}
-	title={$i18n.t('Delete API Key?')}
-	message={$i18n.t('This will revoke the current API key.')}
-	confirmLabel={$i18n.t('Delete')}
-	on:confirm={async () => {
-		const target = _user;
-		try {
-			await deleteUserAPIKeyById(localStorage.token, selectedUser.id);
-			if (target === _user) rotatedAPIKey = '';
-			toast.success($i18n.t('API Key deleted.'));
-		} catch (error) {
-			toast.error(error instanceof Error ? error.message : String(error));
-		}
-	}}
-/>
 
 <ConfirmDialog
 	bind:show={showRevokeConfirmation}
@@ -281,51 +233,12 @@
 											/>
 										</div>
 									</div>
-									<div class="flex items-center justify-between w-full">
-										<div class="text-xs text-gray-500">{$i18n.t('API Key')}</div>
-										<div class="flex items-center gap-3">
-											<button
-												type="button"
-												class="text-xs text-gray-500 transition-colors hover:text-gray-700 disabled:opacity-50 dark:text-gray-400 dark:hover:text-gray-200"
-												on:click={() => {
-													showRotateAPIKeyConfirmation = true;
-												}}>{$i18n.t('Rotate')}</button
-											>
-											<button
-												type="button"
-												class="text-xs text-gray-500 transition-colors hover:text-gray-700 disabled:opacity-50 dark:text-gray-400 dark:hover:text-gray-200"
-												on:click={() => {
-													showDeleteAPIKeyConfirmation = true;
-												}}>{$i18n.t('Delete')}</button
-											>
-										</div>
+									<div class="flex flex-col w-full gap-1.5">
+										<div class="text-xs text-gray-500">{$i18n.t('API Keys')}</div>
+										{#key selectedUser?.id}
+											<ApiKeys userId={selectedUser?.id ?? null} />
+										{/key}
 									</div>
-									{#if rotatedAPIKey}
-										<div class="space-y-1.5">
-											<div class="flex items-center gap-2">
-												<SensitiveInput
-													variant="settings"
-													placeholder={$i18n.t('API Key')}
-													value={rotatedAPIKey}
-													readOnly={true}
-												/>
-												<button
-													type="button"
-													class="shrink-0 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-200"
-													aria-label={$i18n.t('Copy API Key')}
-													on:click={async () => {
-														if (await copyToClipboard(rotatedAPIKey))
-															toast.success($i18n.t('Copied to clipboard'));
-													}}>{$i18n.t('Copy')}</button
-												>
-											</div>
-											<p class="text-xs text-gray-500">
-												{$i18n.t(
-													'Copy this key now. It will not be shown here again after you close this dialog.'
-												)}
-											</p>
-										</div>
-									{/if}
 								</div>
 							</div>
 						</div>
