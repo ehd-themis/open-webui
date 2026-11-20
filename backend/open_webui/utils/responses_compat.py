@@ -10,6 +10,7 @@ The conversion is stateless: the whole conversation is expected in ``input`` on
 every call, which is how Codex works with ``store: false``.
 """
 
+import codecs
 import json
 import logging
 import time as _time
@@ -18,7 +19,7 @@ import uuid as _uuid
 log = logging.getLogger(__name__)
 
 # Request keys copied as-is to the Chat Completions payload.
-PASSTHROUGH_KEYS = ('model', 'stream', 'temperature', 'top_p', 'parallel_tool_calls', 'user', 'seed')
+PASSTHROUGH_KEYS = ('model', 'stream', 'temperature', 'top_p', 'user', 'seed')
 
 # Tool types without a Chat Completions equivalent (web_search, local_shell,
 # image_generation, ...); they are dropped from the request.
@@ -89,14 +90,24 @@ def convert_responses_to_chat_payload(form_data: dict) -> tuple[dict, set]:
         raise ResponsesRequestError('previous_response_id is not supported: send the full conversation in input')
 
     messages = []
+    # Chat templates (Mistral, Gemma, ...) accept a single system message at the very
+    # start: ``instructions`` and the leading system/developer items are merged into
+    # one, and a later developer/system message becomes a user message.
+    system_parts = []
     instructions = form_data.get('instructions')
     if instructions:
-        messages.append({'role': 'system', 'content': instructions})
+        system_parts.append(instructions)
 
     items = form_data.get('input')
     if isinstance(items, str):
         items = [{'type': 'message', 'role': 'user', 'content': items}]
 
+    def flush_system():
+        if system_parts:
+            messages.insert(0, {'role': 'system', 'content': '\n\n'.join(p for p in system_parts if p)})
+            system_parts.clear()
+
+    leading = True
     for item in items or []:
         if not isinstance(item, dict):
             continue
@@ -104,10 +115,30 @@ def convert_responses_to_chat_payload(form_data: dict) -> tuple[dict, set]:
 
         if item_type == 'message':
             role = item.get('role', 'user')
-            role = 'system' if role == 'developer' else role
-            messages.append({'role': role, 'content': _content_to_chat(item.get('content'))})
+            content = _content_to_chat(item.get('content'))
+            if role in ('developer', 'system'):
+                if leading:
+                    system_parts.append(content if isinstance(content, str) else _output_to_text(content))
+                    continue
+                role = 'user'
+            else:
+                leading = False
+            previous = messages[-1] if messages else None
+            if (
+                role == 'user'
+                and previous
+                and previous['role'] == 'user'
+                and isinstance(previous['content'], str)
+                and isinstance(content, str)
+            ):
+                # Strict templates also want roles to alternate.
+                previous['content'] = f'{previous["content"]}\n\n{content}'
+            else:
+                messages.append({'role': role, 'content': content})
+            continue
 
-        elif item_type in ('function_call', 'custom_tool_call'):
+        leading = False
+        if item_type in ('function_call', 'custom_tool_call'):
             if item_type == 'custom_tool_call':
                 arguments = json.dumps({'input': item.get('input', '')})
             else:
@@ -131,6 +162,8 @@ def convert_responses_to_chat_payload(form_data: dict) -> tuple[dict, set]:
                 }
             )
         # reasoning items and built-in tool calls have no chat equivalent.
+
+    flush_system()
 
     payload = {key: form_data[key] for key in PASSTHROUGH_KEYS if form_data.get(key) is not None}
     payload['messages'] = messages
@@ -187,6 +220,9 @@ def convert_responses_to_chat_payload(form_data: dict) -> tuple[dict, set]:
             )
     if tools:
         payload['tools'] = tools
+        # Upstreams such as OpenAI reject parallel_tool_calls when no tools are sent.
+        if form_data.get('parallel_tool_calls') is not None:
+            payload['parallel_tool_calls'] = form_data['parallel_tool_calls']
 
         tool_choice = form_data.get('tool_choice')
         if isinstance(tool_choice, dict) and tool_choice.get('name'):
@@ -424,6 +460,14 @@ async def chat_stream_to_responses_stream(chat_stream_generator, model: str = ''
             else:
                 events.append(
                     event(
+                        'response.function_call_arguments.delta',
+                        item_id=current['id'],
+                        output_index=index,
+                        delta=item['arguments'],
+                    )
+                )
+                events.append(
+                    event(
                         'response.function_call_arguments.done',
                         item_id=current['id'],
                         output_index=index,
@@ -431,7 +475,6 @@ async def chat_stream_to_responses_stream(chat_stream_generator, model: str = ''
                         arguments=item['arguments'],
                     )
                 )
-            call['closed'] = True
         events.append(event('response.output_item.done', output_index=index, item=item))
         output.append(item)
         current = None
@@ -518,6 +561,8 @@ async def chat_stream_to_responses_stream(chat_stream_generator, model: str = ''
                 )
             )
 
+        # Tool calls are only accumulated here and emitted once the stream is over, so
+        # argument deltas that arrive after another call has started are not lost.
         for tool_call in delta.get('tool_calls') or message.get('tool_calls') or []:
             position = tool_call.get('index', 0)
             call_id = tool_call.get('id')
@@ -526,14 +571,7 @@ async def chat_stream_to_responses_stream(chat_stream_generator, model: str = ''
             arguments = function.get('arguments') or ''
 
             if call_id and call_id not in tool_calls:
-                tool_calls[call_id] = {
-                    'id': call_id,
-                    'name': name,
-                    'arguments': '',
-                    'custom': name in custom_tools,
-                    'closed': False,
-                    'item_id': None,
-                }
+                tool_calls[call_id] = {'id': call_id, 'name': name, 'arguments': '', 'custom': name in custom_tools}
             if call_id:
                 index_to_call_id[position] = call_id
             call = tool_calls.get(call_id or index_to_call_id.get(position))
@@ -545,77 +583,66 @@ async def chat_stream_to_responses_stream(chat_stream_generator, model: str = ''
                     'name': name,
                     'arguments': '',
                     'custom': name in custom_tools,
-                    'closed': False,
-                    'item_id': None,
                 }
                 index_to_call_id[position] = call_id
             if name and not call['name']:
                 call['name'] = name
                 call['custom'] = name in custom_tools
-            if call['closed']:
-                continue
-
-            # A tool call item opens once its name is known; any other open item ends first.
-            if call['item_id'] is None and call['name']:
-                if current is not None:
-                    events += close_current()
-                call['item_id'] = _new_id('fc')
-                events += open_item(
-                    'tool',
-                    _call_item(call['item_id'], call['id'], call['name'], '', call['custom'], status='in_progress'),
-                    call=call,
-                )
             call['arguments'] += arguments
-            if arguments and not call['custom'] and current is not None and current.get('call') is call:
-                events.append(
-                    event(
-                        'response.function_call_arguments.delta',
-                        item_id=call['item_id'],
-                        output_index=current['index'],
-                        delta=arguments,
-                    )
-                )
         return events
 
     pending = ''
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='ignore')
+    finished = False  # a finish_reason or the [DONE] marker was seen
+
+    def process_line(line: str) -> list:
+        nonlocal finished
+        line = line.strip()
+        if not line.startswith('data:'):
+            return []
+        data_string = line[5:].strip()
+        if data_string == '[DONE]':
+            finished = True
+            return []
+        if data_string in ('', '{}'):
+            return []
+        try:
+            data = json.loads(data_string)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        events = handle(data)
+        if finish_reason:
+            finished = True
+        return events
+
     try:
         async for chunk in chat_stream_generator:
             if isinstance(chunk, bytes):
-                chunk = chunk.decode('utf-8', errors='ignore')
+                chunk = decoder.decode(chunk)
             pending += chunk
             lines = pending.split('\n')
             pending = lines.pop()
             for line in lines:
-                line = line.strip()
-                if not line.startswith('data:'):
-                    continue
-                data_string = line[5:].strip()
-                if data_string in ('', '[DONE]', '{}'):
-                    continue
-                try:
-                    data = json.loads(data_string)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if isinstance(data, dict):
-                    for e in handle(data):
-                        yield e
+                for e in process_line(line):
+                    yield e
                 if error_message:
                     break
             if error_message:
                 break
-        if pending.strip().startswith('data:') and not error_message:
-            data_string = pending.strip()[5:].strip()
-            if data_string not in ('', '[DONE]', '{}'):
-                try:
-                    data = json.loads(data_string)
-                    if isinstance(data, dict):
-                        for e in handle(data):
-                            yield e
-                except (json.JSONDecodeError, TypeError):
-                    pass
+        if not error_message:
+            pending += decoder.decode(b'', final=True)
+            for e in process_line(pending):
+                yield e
     except Exception as e:
         log.error(f'Error in Responses stream conversion: {e}')
         error_message = 'Chat completion stream failed'
+
+    if not error_message and not finished:
+        # The upstream closed the connection cleanly but early (proxy timeout, ...):
+        # report a failure so the client retries instead of accepting a truncated turn.
+        error_message = 'Stream ended prematurely'
 
     if error_message:
         failed = _response_object(
@@ -632,6 +659,15 @@ async def chat_stream_to_responses_stream(chat_stream_generator, model: str = ''
 
     for e in close_current():
         yield e
+    for call in tool_calls.values():
+        if not call['name']:
+            continue  # a call without a name cannot be run
+        item_id = _new_id('fc')
+        added = _call_item(item_id, call['id'], call['name'], '', call['custom'], status='in_progress')
+        for e in open_item('tool', added, call=call):
+            yield e
+        for e in close_current():
+            yield e
     # A model that answered with nothing still gets an (empty) message, as the API does.
     if not output:
         item_id = _new_id('msg')
@@ -651,3 +687,39 @@ async def chat_stream_to_responses_stream(chat_stream_generator, model: str = ''
         incomplete_reason='max_output_tokens' if truncated else None,
     )
     yield event('response.incomplete' if truncated else 'response.completed', response=final)
+
+
+async def chat_response_to_stream(chat_response: dict):
+    """
+    Replay a non-streaming Chat Completions response as a Chat Completions SSE
+    stream, for a streaming Responses request whose pipeline answered with a
+    plain JSON body (the model's ``stream_response`` is off, or the upstream
+    ignored ``stream``).
+    """
+    choice = (chat_response.get('choices') or [{}])[0]
+    message = choice.get('message') or {}
+    delta = {}
+    if message.get('content'):
+        delta['content'] = message['content']
+    reasoning = _reasoning_text(message)
+    if reasoning:
+        delta['reasoning_content'] = reasoning
+    tool_calls = []
+    for position, call in enumerate(message.get('tool_calls') or []):
+        function = call.get('function') or {}
+        tool_calls.append(
+            {
+                'index': position,
+                'id': call.get('id') or _new_id('call'),
+                'type': 'function',
+                'function': {'name': function.get('name', ''), 'arguments': function.get('arguments') or ''},
+            }
+        )
+    if tool_calls:
+        delta['tool_calls'] = tool_calls
+
+    chunk = {'choices': [{'index': 0, 'delta': delta, 'finish_reason': choice.get('finish_reason') or 'stop'}]}
+    if chat_response.get('usage'):
+        chunk['usage'] = chat_response['usage']
+    yield f'data: {json.dumps(chunk)}\n\n'.encode()
+    yield b'data: [DONE]\n\n'

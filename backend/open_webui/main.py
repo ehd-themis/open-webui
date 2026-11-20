@@ -2267,6 +2267,7 @@ async def completions(
 
 from open_webui.utils.responses_compat import (
     ResponsesRequestError,
+    chat_response_to_stream,
     chat_stream_to_responses_stream,
     convert_chat_to_responses_response,
     convert_responses_to_chat_payload,
@@ -2299,14 +2300,28 @@ async def responses(
 
     response = await chat_completion(request, chat_payload, user)
 
+    stream_headers = {'Cache-Control': 'no-cache', 'Connection': 'keep-alive'}
+
     if isinstance(response, StreamingResponse):
         return StreamingResponse(
             chat_stream_to_responses_stream(response.body_iterator, model=requested_model, custom_tools=custom_tools),
             media_type='text/event-stream',
-            headers={
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-            },
+            headers=stream_headers,
+        )
+    elif isinstance(response, dict) and response.get('error'):
+        # A pipe function or an upstream answered 200 with an error body.
+        error = response['error']
+        message = error.get('message') if isinstance(error, dict) else str(error)
+        raise HTTPException(status_code=502, detail=message or 'Upstream error')
+    elif isinstance(response, dict) and chat_payload.get('stream'):
+        # The client asked for a stream but the pipeline answered with plain JSON
+        # (stream_response is off for the model, or the upstream ignored `stream`).
+        return StreamingResponse(
+            chat_stream_to_responses_stream(
+                chat_response_to_stream(response), model=requested_model, custom_tools=custom_tools
+            ),
+            media_type='text/event-stream',
+            headers=stream_headers,
         )
     elif isinstance(response, dict):
         return convert_chat_to_responses_response(response, model=requested_model, custom_tools=custom_tools)

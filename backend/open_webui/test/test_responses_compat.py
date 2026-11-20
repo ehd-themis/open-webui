@@ -12,6 +12,8 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from open_webui.utils.responses_compat import (
     ResponsesRequestError,
+    chat_response_to_stream,
+    chat_response_to_stream,
     chat_stream_to_responses_stream,
     convert_chat_to_responses_response,
     convert_responses_to_chat_payload,
@@ -71,8 +73,7 @@ def test_request_maps_instructions_input_and_sampling():
     )
 
     assert payload['messages'] == [
-        {'role': 'system', 'content': 'Be brief.'},
-        {'role': 'system', 'content': 'rules'},
+        {'role': 'system', 'content': 'Be brief.\n\nrules'},
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'hello'},
     ]
@@ -164,6 +165,64 @@ def test_request_custom_tool_history_becomes_function_call():
 def test_request_rejects_previous_response_id():
     with pytest.raises(ResponsesRequestError):
         convert_responses_to_chat_payload({'model': 'qwen', 'input': 'hi', 'previous_response_id': 'resp_1'})
+
+
+def test_request_merges_system_messages_and_demotes_later_ones():
+    payload, _ = convert_responses_to_chat_payload(
+        {
+            'model': 'qwen',
+            'instructions': 'Base.',
+            'input': [
+                {'type': 'message', 'role': 'developer', 'content': [{'type': 'input_text', 'text': 'perms'}]},
+                {'type': 'message', 'role': 'user', 'content': 'env context'},
+                {'type': 'message', 'role': 'user', 'content': 'do it'},
+                {'type': 'function_call', 'call_id': 'c1', 'name': 'sh', 'arguments': '{}'},
+                {'type': 'function_call_output', 'call_id': 'c1', 'output': 'done'},
+                {'type': 'message', 'role': 'developer', 'content': [{'type': 'input_text', 'text': 'mode changed'}]},
+                {'type': 'message', 'role': 'user', 'content': 'next'},
+            ],
+        }
+    )
+
+    roles = [m['role'] for m in payload['messages']]
+    assert roles == ['system', 'user', 'assistant', 'tool', 'user']
+    assert payload['messages'][0]['content'] == 'Base.\n\nperms'
+    assert payload['messages'][1]['content'] == 'env context\n\ndo it'
+    assert payload['messages'][4]['content'] == 'mode changed\n\nnext'
+
+
+def test_request_parallel_tool_calls_only_with_tools():
+    without, _ = convert_responses_to_chat_payload(
+        {'model': 'qwen', 'input': 'hi', 'parallel_tool_calls': True, 'tools': [{'type': 'web_search'}]}
+    )
+    with_tools, _ = convert_responses_to_chat_payload(
+        {
+            'model': 'qwen',
+            'input': 'hi',
+            'parallel_tool_calls': False,
+            'tools': [{'type': 'function', 'name': 'sh'}],
+        }
+    )
+
+    assert 'parallel_tool_calls' not in without and 'tools' not in without
+    assert with_tools['parallel_tool_calls'] is False
+
+
+def test_request_tool_choice_and_custom_tool_output():
+    payload, _ = convert_responses_to_chat_payload(
+        {
+            'model': 'qwen',
+            'input': [
+                {'type': 'custom_tool_call', 'call_id': 'p1', 'name': 'apply_patch', 'input': 'P'},
+                {'type': 'custom_tool_call_output', 'call_id': 'p1', 'output': 'ok'},
+            ],
+            'tools': [{'type': 'function', 'name': 'sh'}, {'type': 'custom', 'name': 'apply_patch'}],
+            'tool_choice': {'type': 'function', 'name': 'sh'},
+        }
+    )
+
+    assert payload['tool_choice'] == {'type': 'function', 'function': {'name': 'sh'}}
+    assert payload['messages'][-1] == {'role': 'tool', 'tool_call_id': 'p1', 'content': 'ok'}
 
 
 # --- non-streaming response ---
@@ -333,6 +392,74 @@ async def test_stream_empty_answer_still_has_a_message():
     assert [item['type'] for item in events[-1]['response']['output']] == ['message']
 
 
+@pytest.mark.asyncio
+async def test_stream_keeps_arguments_of_interleaved_tool_calls():
+    chunks = sse(
+        delta(tool_calls=[{'index': 0, 'id': 'a', 'function': {'name': 'sh', 'arguments': ''}}]),
+        delta(tool_calls=[{'index': 1, 'id': 'b', 'function': {'name': 'ls', 'arguments': ''}}]),
+        delta(tool_calls=[{'index': 0, 'function': {'arguments': '{"x":1}'}}]),
+        delta(tool_calls=[{'index': 1, 'function': {'arguments': '{"y":2}'}}]),
+        finish('tool_calls'),
+    )
+    events = await collect(chat_stream_to_responses_stream(agen(chunks), model='qwen'))
+
+    done = [e['item'] for e in events if e['type'] == 'response.output_item.done']
+    assert [(i['call_id'], i['arguments']) for i in done] == [('a', '{"x":1}'), ('b', '{"y":2}')]
+    assert [e['output_index'] for e in events if e['type'] == 'response.output_item.added'] == [0, 1]
+    assert events[-1]['response']['output'] == done
+
+
+@pytest.mark.asyncio
+async def test_stream_ending_without_finish_reason_fails_the_response():
+    chunks = [f'data: {json.dumps(delta(content="hi"))}\n\n'.encode()]
+    events = await collect(chat_stream_to_responses_stream(agen(chunks), model='qwen'))
+
+    assert events[-1]['type'] == 'response.failed'
+    assert events[-1]['response']['error']['message'] == 'Stream ended prematurely'
+    assert 'response.completed' not in [e['type'] for e in events]
+
+
+@pytest.mark.asyncio
+async def test_stream_finish_reason_without_done_marker_completes():
+    chunks = [f'data: {json.dumps(finish("stop"))}\n\n'.encode()]
+    events = await collect(chat_stream_to_responses_stream(agen(chunks), model='qwen'))
+
+    assert events[-1]['type'] == 'response.completed'
+
+
+@pytest.mark.asyncio
+async def test_stream_keeps_multibyte_characters_split_across_reads():
+    line = f'data: {json.dumps(delta(content="café"), ensure_ascii=False)}\n\ndata: [DONE]\n\n'.encode()
+    cut = line.index('é'.encode()) + 1  # in the middle of the two-byte character
+    events = await collect(chat_stream_to_responses_stream(agen([line[:cut], line[cut:]]), model='qwen'))
+
+    assert ''.join(e['delta'] for e in events if e['type'] == 'response.output_text.delta') == 'café'
+
+
+@pytest.mark.asyncio
+async def test_json_response_replayed_as_a_stream():
+    chat_response = {
+        'choices': [
+            {
+                'message': {
+                    'content': 'Checking.',
+                    'reasoning_content': 'thinking',
+                    'tool_calls': [{'id': 'c1', 'function': {'name': 'sh', 'arguments': '{"cmd":"ls"}'}}],
+                },
+                'finish_reason': 'tool_calls',
+            }
+        ],
+        'usage': {'prompt_tokens': 3, 'completion_tokens': 4},
+    }
+    events = await collect(chat_stream_to_responses_stream(chat_response_to_stream(chat_response), model='qwen'))
+
+    done = [e['item'] for e in events if e['type'] == 'response.output_item.done']
+    assert [item['type'] for item in done] == ['reasoning', 'message', 'function_call']
+    assert done[2]['arguments'] == '{"cmd":"ls"}'
+    assert events[-1]['type'] == 'response.completed'
+    assert events[-1]['response']['usage']['output_tokens'] == 4
+
+
 # --- endpoint ---
 
 
@@ -401,3 +528,24 @@ async def test_endpoint_rejects_previous_response_id(main, chat):
 
     assert error.value.status_code == 400
     assert chat.payload is None
+
+
+@pytest.mark.asyncio
+async def test_endpoint_streams_when_pipeline_answers_with_json(main, chat):
+    response = await main.responses(make_request(), {'model': 'qwen', 'input': 'hi', 'stream': True}, USER)
+
+    assert response.media_type == 'text/event-stream'
+    events = await collect(response.body_iterator)
+    assert events[-1]['type'] == 'response.completed'
+    assert events[-1]['response']['output'][0]['content'][0]['text'] == 'ok'
+
+
+@pytest.mark.asyncio
+async def test_endpoint_turns_a_200_error_body_into_an_error(main, chat):
+    chat.result = {'error': {'message': 'pipe failed'}}
+
+    with pytest.raises(HTTPException) as error:
+        await main.responses(make_request(), {'model': 'qwen', 'input': 'hi'}, USER)
+
+    assert error.value.status_code == 502
+    assert error.value.detail == 'pipe failed'
