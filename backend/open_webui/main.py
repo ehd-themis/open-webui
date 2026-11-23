@@ -1795,7 +1795,8 @@ async def chat_completion(
             # MCPClient.disconnect() suppresses known transport teardown errors
             # while still propagating real task cancellation.
             try:
-                if mcp_clients := metadata.get('mcp_clients'):
+                # Fork: a plain-HTTP tool loop still reads its stream after this returns and closes the clients itself.
+                if (mcp_clients := metadata.get('mcp_clients')) and not metadata.get('api_tool_loop_owns_mcp'):
                     for client in reversed(list(mcp_clients.values())):
                         try:
                             await client.disconnect()

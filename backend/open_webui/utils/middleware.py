@@ -89,6 +89,7 @@ from open_webui.utils.ask_user import stage_ask_user_tool_calls
 from open_webui.utils.audit import log_model_usage
 from open_webui.utils.auth import get_verified_user_by_id
 from open_webui.utils.chat import generate_chat_completion
+from open_webui.utils import api_tool_loop
 from open_webui.utils.chat_id import is_saved_chat_id, is_temporary_chat_id
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.context_compaction import apply_summary_checkpoint, compact_messages, split_messages
@@ -2675,7 +2676,18 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # When the caller provides an explicit `tools` key in the request body,
     # skip all server-side tool resolution and pass the caller's tools through
     # unchanged.  Sending `tools: []` explicitly opts out of builtin injection.
-    if payload_tools is None:
+    # Fork: unless the request also names `tool_ids` (native function calling): those are resolved and run on the
+    # server next to the caller's own tools (see utils/api_tool_loop.py).
+    mixed_tools = (
+        payload_tools is not None
+        and bool(metadata.get('tool_ids'))
+        and metadata.get('params', {}).get('function_calling') != 'legacy'
+    )
+    if mixed_tools:
+        metadata['api_tool_mix'] = True
+        terminal_id = None
+        metadata['terminal_id'] = None
+    if payload_tools is None or mixed_tools:
         tool_ids = metadata.get('tool_ids', None)
         log.debug('tool_ids=%r', tool_ids)
 
@@ -2698,6 +2710,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             extra_params,
                         )
                         if result is None:
+                            api_tool_loop.record_connection_error(metadata, server_id, 'unavailable')
                             continue
 
                         client, tool_specs = result
@@ -2737,8 +2750,13 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                                 'type': 'mcp',
                                 'client': client,
                             }
-                    except Exception:
+                    except Exception as exc:
                         log.exception("Failed to connect to MCP server '%s'", server_id)
+                        api_tool_loop.record_connection_error(
+                            metadata,
+                            server_id,
+                            'auth_required' if isinstance(exc, HTTPException) and exc.status_code == 401 else 'failed',
+                        )
                         if event_emitter:
                             await event_emitter(
                                 {
@@ -2813,7 +2831,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         # Inject builtin tools for native function calling based on enabled features and model capability.
         # Only inject when the request originates from the UI (identified by session_id).
         # API callers don't expect hidden tools; they can explicitly request tools via tool_ids.
-        if use_builtin_tools:
+        if use_builtin_tools and not mixed_tools:
             if model_builtin_tools.get('knowledge', True):
                 from html import escape
 
@@ -2888,11 +2906,18 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 )
 
                 # If the function calling is native, then call the tools function calling handler
-                form_data['tools'] = [
-                    {'type': 'function', 'function': tool.get('spec', {})}
-                    for name, tool in tools_dict.items()
-                    if name not in deferred
-                ]
+                if mixed_tools:
+                    # The caller's tools stay the caller's; the server tools are offered next to them (caller wins a clash).
+                    form_data['tools'], tools_dict = api_tool_loop.merge_caller_and_server_tools(
+                        payload_tools, {name: tool for name, tool in tools_dict.items() if name not in deferred}
+                    )
+                    metadata['tools'] = tools_dict
+                else:
+                    form_data['tools'] = [
+                        {'type': 'function', 'function': tool.get('spec', {})}
+                        for name, tool in tools_dict.items()
+                        if name not in deferred
+                    ]
                 if inlet_filter_tools:
                     form_data['tools'].extend(inlet_filter_tools)
             else:
@@ -4297,7 +4322,10 @@ async def streaming_chat_response_handler(response, ctx):
     # Standard streaming response handler
     # event_caller is optional — only needed for direct (client-side) tools
     # and pyodide code interpreter. Server-side tools work without it.
-    if event_emitter:
+    # Fork: a plain HTTP request that has server tools, or that mixes them with the caller's own tools, runs its tool
+    # loop over the HTTP stream itself (utils/api_tool_loop.py); the chat UI path below is unchanged.
+    wants_api_tool_loop = api_tool_loop.wants_loop(metadata, event_emitter)
+    if event_emitter and not wants_api_tool_loop:
         task_id = str(uuid4())  # Create a unique task ID.
 
         # Handle as a background task
@@ -6656,6 +6684,9 @@ async def streaming_chat_response_handler(response, ctx):
                 await response.background()
 
         return await response_handler(response, events)
+
+    elif wants_api_tool_loop:
+        return api_tool_loop.streaming_response(request, user, form_data, metadata, response)
 
     else:
         # Fallback to the original response
