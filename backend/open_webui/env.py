@@ -263,6 +263,10 @@ DATABASE_URL = os.getenv('DATABASE_URL', f'sqlite:///{DATA_DIR}/webui.db')
 DATABASE_TYPE = os.getenv('DATABASE_TYPE')
 DATABASE_USER = os.getenv('DATABASE_USER')
 DATABASE_PASSWORD = os.getenv('DATABASE_PASSWORD')
+# Fork: the password can come from a file (a Docker secret) so it stays out of the container's environment.
+if not DATABASE_PASSWORD and os.getenv('DATABASE_PASSWORD_FILE'):
+    with open(os.environ['DATABASE_PASSWORD_FILE'], encoding='utf-8') as password_file:
+        DATABASE_PASSWORD = password_file.read().strip()
 
 DATABASE_CRED = ''
 if DATABASE_USER:

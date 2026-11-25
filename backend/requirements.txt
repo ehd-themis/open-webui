@@ -33,6 +33,8 @@ python-mimeparse==2.0.0
 
 sqlalchemy[asyncio]==2.0.50
 aiosqlite==0.22.1
+# Fork: SQLite encrypted at rest (DATABASE_TYPE=sqlite+sqlcipher), see docs/ENCRYPTION.fork.md
+sqlcipher3-wheels==0.5.7
 psycopg[binary]==3.3.4
 alembic==1.18.4
 

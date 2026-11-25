@@ -25,11 +25,13 @@ from open_webui.env import (
     DATABASE_SQLITE_PRAGMA_MMAP_SIZE,
     DATABASE_SQLITE_PRAGMA_SYNCHRONOUS,
     DATABASE_SQLITE_PRAGMA_TEMP_STORE,
+    DATABASE_PASSWORD,
     DATABASE_URL,
     ENABLE_DB_MIGRATIONS,
     OPEN_WEBUI_DIR,
     USE_SLIM,
 )
+from open_webui.internal import sqlcipher
 from open_webui.utils.json_codec import JSONCodec
 from sqlalchemy import Dialect, MetaData, create_engine, event, text, types
 from sqlalchemy.engine.url import make_url
@@ -288,11 +290,9 @@ def _make_async_url(url: str) -> str:
     ``options``, ``target_session_attrs``, etc.) are passed through
     without any translation.
     """
-    if url.startswith('sqlite+sqlcipher://'):
-        raise ValueError(
-            'sqlite+sqlcipher:// URLs are not supported with async engine. '
-            'Use standard sqlite:// or postgresql:// instead.'
-        )
+    if url.startswith(sqlcipher.URL_PREFIX):
+        # Same aiosqlite dialect; the connections themselves come from internal/sqlcipher.py.
+        return url.replace(sqlcipher.URL_PREFIX, 'sqlite+aiosqlite://', 1)
     if url.startswith('sqlite:///') or url.startswith('sqlite://'):
         return url.replace('sqlite://', 'sqlite+aiosqlite://', 1)
     # psycopg v3 — auto-selects async mode with create_async_engine
@@ -330,52 +330,39 @@ def _create_async_engine(*args, **kwargs):
 # Sync engine (used only for: startup migrations, config loading,
 #              Alembic, peewee migration, health checks)
 
-# Handle SQLCipher URLs
-if SQLALCHEMY_DATABASE_URL.startswith('sqlite+sqlcipher://'):
-    database_password = os.environ.get('DATABASE_PASSWORD')
-    if not database_password or database_password.strip() == '':
-        raise ValueError('DATABASE_PASSWORD is required when using sqlite+sqlcipher:// URLs')
+_IS_SQLCIPHER = SQLALCHEMY_DATABASE_URL.startswith(sqlcipher.URL_PREFIX)
 
-    # Extract database path from SQLCipher URL
-    db_path = SQLALCHEMY_DATABASE_URL.replace('sqlite+sqlcipher://', '')
+if 'sqlite' in SQLALCHEMY_DATABASE_URL:
+    if _IS_SQLCIPHER:
+        if not DATABASE_PASSWORD or not DATABASE_PASSWORD.strip():
+            raise ValueError('DATABASE_PASSWORD (or DATABASE_PASSWORD_FILE) is required with sqlite+sqlcipher')
 
-    # Create a custom creator function that uses sqlcipher3
-    def create_sqlcipher_connection():
-        import sqlcipher3
-
-        conn = sqlcipher3.connect(db_path, check_same_thread=False)
-        conn.execute(f"PRAGMA key = '{database_password}'")
-        return conn
-
-    # The dummy "sqlite://" URL would cause SQLAlchemy to auto-select
-    # SingletonThreadPool, which non-deterministically closes in-use
-    # connections when thread count exceeds pool_size, leading to segfaults
-    # in the native sqlcipher3 C library. Use NullPool by default for safety,
-    # or QueuePool if DATABASE_POOL_SIZE is explicitly configured.
-    if isinstance(DATABASE_POOL_SIZE, int) and DATABASE_POOL_SIZE > 0:
-        engine = _create_engine(
-            'sqlite://',
-            creator=create_sqlcipher_connection,
-            pool_size=DATABASE_POOL_SIZE,
-            max_overflow=DATABASE_POOL_MAX_OVERFLOW,
-            pool_timeout=DATABASE_POOL_TIMEOUT,
-            pool_recycle=DATABASE_POOL_RECYCLE,
-            pool_pre_ping=True,
-            poolclass=QueuePool,
-            echo=False,
+        _sqlcipher_options = sqlcipher.sync_engine_options(
+            sqlcipher.database_path(SQLALCHEMY_DATABASE_URL), DATABASE_PASSWORD
         )
+        # The dummy "sqlite://" URL would cause SQLAlchemy to auto-select
+        # SingletonThreadPool, which non-deterministically closes in-use
+        # connections when thread count exceeds pool_size, leading to segfaults
+        # in the native sqlcipher3 C library. Use NullPool by default for safety,
+        # or QueuePool if DATABASE_POOL_SIZE is explicitly configured.
+        if isinstance(DATABASE_POOL_SIZE, int) and DATABASE_POOL_SIZE > 0:
+            engine = _create_engine(
+                'sqlite://',
+                **_sqlcipher_options,
+                pool_size=DATABASE_POOL_SIZE,
+                max_overflow=DATABASE_POOL_MAX_OVERFLOW,
+                pool_timeout=DATABASE_POOL_TIMEOUT,
+                pool_recycle=DATABASE_POOL_RECYCLE,
+                pool_pre_ping=True,
+                poolclass=QueuePool,
+                echo=False,
+            )
+        else:
+            engine = _create_engine('sqlite://', **_sqlcipher_options, poolclass=NullPool, echo=False)
+
+        log.info('Connected to encrypted SQLite database using SQLCipher')
     else:
-        engine = _create_engine(
-            'sqlite://',
-            creator=create_sqlcipher_connection,
-            poolclass=NullPool,
-            echo=False,
-        )
-
-    log.info('Connected to encrypted SQLite database using SQLCipher')
-
-elif 'sqlite' in SQLALCHEMY_DATABASE_URL:
-    engine = _create_engine(SQLALCHEMY_DATABASE_URL, connect_args={'check_same_thread': False})
+        engine = _create_engine(SQLALCHEMY_DATABASE_URL, connect_args={'check_same_thread': False})
 
     def _apply_sqlite_pragmas(dbapi_connection):
         """Apply all configured SQLite PRAGMAs to a raw DBAPI connection."""
@@ -508,9 +495,14 @@ if 'sqlite' in ASYNC_SQLALCHEMY_DATABASE_URL:
     # No pool_pre_ping: a local SQLite file cannot drop connections, and the
     # ping costs a worker-thread hop plus a SELECT 1 on every checkout.
     _sqlite_pool_size = DATABASE_POOL_SIZE if isinstance(DATABASE_POOL_SIZE, int) and DATABASE_POOL_SIZE > 0 else 512
+    _sqlite_async_options = (
+        sqlcipher.async_engine_options(sqlcipher.database_path(SQLALCHEMY_DATABASE_URL), DATABASE_PASSWORD)
+        if _IS_SQLCIPHER
+        else {'connect_args': {'check_same_thread': False}}
+    )
     async_engine = _create_async_engine(
         ASYNC_SQLALCHEMY_DATABASE_URL,
-        connect_args={'check_same_thread': False},
+        **_sqlite_async_options,
         pool_size=_sqlite_pool_size,
         pool_timeout=DATABASE_POOL_TIMEOUT,
         pool_recycle=DATABASE_POOL_RECYCLE,

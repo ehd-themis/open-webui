@@ -9,6 +9,7 @@ import logging.config
 import alembic.context
 from alembic.runtime.migration import MigrationContext
 from open_webui.env import DATABASE_PASSWORD, DATABASE_SCHEMA, DATABASE_URL, GLOBAL_LOG_LEVEL, LOG_FORMAT
+from open_webui.internal import sqlcipher
 from open_webui.internal.db import enable_iam_token_auth, extract_ssl_params_from_url, reattach_ssl_params_to_url
 from open_webui.models.auths import Auth
 from open_webui.models.calendar import Calendar, CalendarEvent, CalendarEventAttendee  # noqa: F401
@@ -51,21 +52,11 @@ def run_migrations_offline() -> None:
 
 def _get_engine_connectable():
     """Build the database engine based on target URL and authentication credentials."""
-    if target_db_url and target_db_url.startswith('sqlite+sqlcipher://'):
+    if target_db_url and target_db_url.startswith(sqlcipher.URL_PREFIX):
         if not DATABASE_PASSWORD or not DATABASE_PASSWORD.strip():
-            raise ValueError('DATABASE_PASSWORD is required when using sqlite+sqlcipher:// URLs')
-        raw_db_path = target_db_url.replace('sqlite+sqlcipher://', '')
-        if raw_db_path.startswith('/'):
-            raw_db_path = raw_db_path[1:]
-
-        def _sqlite_cipher_creator():
-            import sqlcipher3
-
-            cipher_conn = sqlcipher3.connect(raw_db_path, check_same_thread=False)
-            cipher_conn.execute(f"PRAGMA key = '{DATABASE_PASSWORD}'")
-            return cipher_conn
-
-        return create_engine('sqlite://', creator=_sqlite_cipher_creator, echo=False)
+            raise ValueError('DATABASE_PASSWORD (or DATABASE_PASSWORD_FILE) is required with sqlite+sqlcipher')
+        options = sqlcipher.sync_engine_options(sqlcipher.database_path(target_db_url), DATABASE_PASSWORD)
+        return create_engine('sqlite://', **options, echo=False)
     return engine_from_config(
         alembic_config.get_section(alembic_config.config_ini_section, {}),
         prefix='sqlalchemy.',
