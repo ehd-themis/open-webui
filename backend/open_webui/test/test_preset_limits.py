@@ -64,7 +64,9 @@ async def run(monkeypatch, custom_models):
     monkeypatch.setattr(models_utils, 'get_functions_cache', lambda request: {})
     monkeypatch.setattr(models_utils, 'ENABLE_FUNCTIONS', False)
 
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(redis=None, MODELS={}, BASE_MODELS=[])))
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(redis=None, MODELS={}, BASE_MODELS=[], BASE_MODELS_SNAPSHOT=None))
+    )
     return {m['id']: m for m in await models_utils.get_all_models(request)}
 
 

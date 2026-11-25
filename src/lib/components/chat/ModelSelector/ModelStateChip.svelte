@@ -79,7 +79,7 @@
 
 {#if availability}
 	<Tooltip content={texts.label} className="shrink-0">
-		<span class="flex items-center gap-1 text-xs font-normal text-gray-500 dark:text-gray-400">
+		<span class="flex items-center gap-1 text-xs font-normal text-base-500 dark:text-base-400">
 			<span
 				class="size-2 shrink-0 rounded-full {availabilityDot(availability)}"
 				aria-hidden="true"
