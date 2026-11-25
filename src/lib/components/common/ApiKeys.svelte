@@ -48,9 +48,9 @@
 	let showDeleteAllConfirm = false;
 
 	const inputClass =
-		'h-7 rounded-lg border border-gray-100/50 bg-gray-50/40 px-2 text-xs text-gray-700 outline-hidden transition-colors placeholder:text-gray-300 focus:border-blue-400 dark:border-white/[0.04] dark:bg-white/[0.03] dark:text-gray-300 dark:placeholder:text-gray-700 dark:focus:border-blue-500';
+		'h-7 rounded-lg border border-base-100/50 bg-base-50/40 px-2 text-xs text-base-700 outline-hidden transition-colors placeholder:text-base-300 focus:border-blue-400 dark:border-white/[0.04] dark:bg-white/[0.03] dark:text-base-300 dark:placeholder:text-base-700 dark:focus:border-blue-500';
 	const linkButtonClass =
-		'text-xs text-gray-500 transition-colors hover:text-gray-900 disabled:opacity-50 dark:text-gray-500 dark:hover:text-white';
+		'text-xs text-base-500 transition-colors hover:text-base-900 disabled:opacity-50 dark:text-base-500 dark:hover:text-white';
 
 	const errorText = (error: unknown) =>
 		typeof error === 'string' ? error : error instanceof Error ? error.message : `${error}`;
@@ -150,22 +150,22 @@
 
 <div class="flex flex-col gap-2">
 	{#if loaded && keys.length === 0}
-		<div class="text-xs text-gray-400 dark:text-gray-600">{$i18n.t('No API keys yet.')}</div>
+		<div class="text-xs text-base-400 dark:text-base-600">{$i18n.t('No API keys yet.')}</div>
 	{/if}
 
 	{#each keys as key (key.id)}
 		<div
-			class="flex items-center justify-between gap-3 rounded-lg border border-gray-100/50 px-2.5 py-1.5 dark:border-white/[0.04]"
+			class="flex items-center justify-between gap-3 rounded-lg border border-base-100/50 px-2.5 py-1.5 dark:border-white/[0.04]"
 		>
 			<div class="min-w-0">
-				<div class="flex items-center gap-1.5 text-xs text-gray-800 dark:text-gray-200">
+				<div class="flex items-center gap-1.5 text-xs text-base-800 dark:text-base-200">
 					<span class="truncate">{key.name ?? $i18n.t('Default key')}</span>
-					<span class="shrink-0 font-mono text-[0.625rem] text-gray-400">{key.key_preview}</span>
+					<span class="shrink-0 font-mono text-[0.625rem] text-base-400">{key.key_preview}</span>
 					{#if isExpired(key)}
 						<span class="shrink-0 text-[0.625rem] text-red-500">{$i18n.t('Expired')}</span>
 					{/if}
 				</div>
-				<div class="text-[0.625rem] text-gray-400 dark:text-gray-600">
+				<div class="text-[0.625rem] text-base-400 dark:text-base-600">
 					{$i18n.t('Created {{date}}', { date: formatDate(key.created_at) })}
 					·
 					{key.last_used_at
@@ -202,7 +202,7 @@
 
 	{#if revealed}
 		<div class="space-y-1.5 rounded-lg border border-blue-200/60 p-2.5 dark:border-blue-500/20">
-			<div class="text-xs text-gray-700 dark:text-gray-300">{revealed.name}</div>
+			<div class="text-xs text-base-700 dark:text-base-300">{revealed.name}</div>
 			<div class="flex items-center gap-2">
 				<SensitiveInput
 					variant="settings"
@@ -212,7 +212,7 @@
 				/>
 				<button
 					type="button"
-					class="shrink-0 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-200"
+					class="shrink-0 text-xs text-base-500 hover:text-base-700 dark:hover:text-base-200"
 					aria-label={$i18n.t('Copy API Key')}
 					on:click={async () => {
 						if (revealed && (await copyToClipboard(revealed.key)))
@@ -221,13 +221,13 @@
 				>
 				<button
 					type="button"
-					class="shrink-0 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-200"
+					class="shrink-0 text-xs text-base-500 hover:text-base-700 dark:hover:text-base-200"
 					on:click={() => {
 						revealed = null;
 					}}>{$i18n.t('Close')}</button
 				>
 			</div>
-			<p class="text-xs text-gray-500">
+			<p class="text-xs text-base-500">
 				{$i18n.t('Copy this key now. It will not be shown again.')}
 			</p>
 		</div>

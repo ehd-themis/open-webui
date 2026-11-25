@@ -21,4 +21,5 @@ Changes made in the ehd-themis fork on top of upstream Open WebUI. Upstream's re
 
 ### Changed
 
+- ⬆️ **Synced to upstream v0.13.5.** Upstream now stops a tool that fails twice with the same arguments and asks for a final answer at the iteration limit; the fork keeps its own notices (the iteration limit and repeated identical calls that succeed) in place of upstream's generic prompt. Upstream's `TOOL_OUTPUT_MAX_CHARS` (unset by default) is applied after the fork removes base64 blobs; the fork cap `CHAT_RESPONSE_TOOL_RESULT_MAX_CHARS` still applies when model messages are built.
 - 🏷️ **IDE autocomplete is forwarded as a task.** `/api/completions` requests that carry no `metadata.task` are now marked `task: "autocomplete"`, so a connection header templated with `{{TASK}}` (e.g. `X-Gateway-Task`) arrives as `autocomplete` instead of empty and gateways can tell autocomplete from interactive chat. The chat-completions fallback for providers without a native `/completions` route is marked the same way. A task set by the caller is kept.

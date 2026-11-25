@@ -62,6 +62,7 @@ def make_request():
         headers={},
         cookies={},
         state=SimpleNamespace(),
+        client=None,
     )
 
 
