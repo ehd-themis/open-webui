@@ -26,6 +26,7 @@ from open_webui.models.channels import Channel, ChannelMember, Channels
 from open_webui.models.chat_messages import ChatMessages
 from open_webui.models.chats import Chats, chat_search_content_query, chat_search_terms
 from open_webui.models.config import Config
+from open_webui.utils.code_interpreter_files import attach_code_interpreter_files
 from open_webui.models.groups import Groups
 from open_webui.models.memories import Memories
 from open_webui.models.messages import Message, Messages
@@ -802,6 +803,7 @@ async def execute_code(
             code = blocking_code + '\n' + code
 
         engine = await Config.get('code_interpreter.engine', 'pyodide')
+        created_files = []
         if engine == 'pyodide':
             # Execute via frontend pyodide using bidirectional event call
             if __event_call__ is None:
@@ -832,6 +834,10 @@ async def execute_code(
                     stdout = output.get('stdout', '')
                     stderr = output.get('stderr', '')
                     result = output.get('result', '')
+                # Fork: files the run wrote to /mnt/uploads, uploaded by the page, become attachments.
+                created_files = await attach_code_interpreter_files(
+                    output, (__user__ or {}).get('id'), __event_emitter__
+                )
             else:
                 stdout = ''
                 stderr = ''
@@ -901,6 +907,12 @@ async def execute_code(
             'stderr': stderr,
             'result': result,
         }
+        if created_files:
+            response['files'] = [{'name': item['name'], 'url': item['url']} for item in created_files]
+            response['files_note'] = (
+                'These files are attached to your reply for the user to download. '
+                'Link them with these URLs, as Markdown links; do not point to /mnt/uploads or a file browser.'
+            )
 
         return JSONCodec.dumps(response, ensure_ascii=False)
     except Exception as e:

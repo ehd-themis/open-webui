@@ -117,7 +117,7 @@ function fsUploadFiles(files: { name: string; data: ArrayBuffer }[], dir = '/mnt
 }
 
 function fsList(path: string) {
-	const entries: { name: string; type: 'file' | 'directory'; size: number }[] = [];
+	const entries: { name: string; type: 'file' | 'directory'; size: number; mtime: number }[] = [];
 	try {
 		const items = self.pyodide.FS.readdir(path).filter((n: string) => n !== '.' && n !== '..');
 		for (const name of items) {
@@ -127,7 +127,8 @@ function fsList(path: string) {
 				entries.push({
 					name,
 					type: isDir ? 'directory' : 'file',
-					size: isDir ? 0 : stat.size
+					size: isDir ? 0 : stat.size,
+					mtime: stat.mtime instanceof Date ? stat.mtime.getTime() : Number(stat.mtime) || 0
 				});
 			} catch {
 				// skip inaccessible entries
