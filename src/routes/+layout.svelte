@@ -46,6 +46,7 @@
 	import { cachedChats, pendingChatRequest } from '$lib/stores/chatCache';
 	import { clearFolderStates } from '$lib/stores/folderStates';
 	import { getFileContentById } from '$lib/apis/files';
+	import { snapshotOutputFiles, uploadChangedOutputFiles } from '$lib/pyodide/outputFiles';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { beforeNavigate } from '$app/navigation';
@@ -360,6 +361,10 @@
 			}
 		}
 
+		// Fork: list /mnt/uploads first, so the files this run creates or changes can be attached.
+		const outputSnapshot = await snapshotOutputFiles(worker);
+		const inputNames = new Set(filePayloads.map((file) => file.name));
+
 		worker.postMessage({
 			type: 'execute',
 			id: id,
@@ -396,7 +401,7 @@
 		}, 60000);
 
 		// Use addEventListener so multiple concurrent executions don't clobber each other
-		const onMessage = (event) => {
+		const onMessage = async (event) => {
 			const { id: eventId, ...data } = event.data;
 			// Only handle responses for this execution ID
 			if (eventId !== id) return;
@@ -412,6 +417,11 @@
 			data['stderr'] && (stderr = data['stderr']);
 			data['result'] && (result = data['result']);
 
+			// Fork: upload what the run wrote to /mnt/uploads; the backend attaches it to the message.
+			const outputFiles = outputSnapshot
+				? await uploadChangedOutputFiles(worker, outputSnapshot, inputNames, localStorage.token)
+				: [];
+
 			if (cb) {
 				cb(
 					JSON.parse(
@@ -419,7 +429,8 @@
 							{
 								stdout: stdout,
 								stderr: stderr,
-								result: result
+								result: result,
+								...(outputFiles.length > 0 ? { files: outputFiles } : {})
 							},
 							(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
 						)

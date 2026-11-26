@@ -139,6 +139,7 @@ from open_webui.utils.misc import (
     strip_empty_content_blocks,
 )
 from open_webui.utils.tool_output_limit import replace_base64_blobs
+from open_webui.utils.code_interpreter_files import attach_code_interpreter_files
 from open_webui.utils.models import check_model_access
 from open_webui.utils.oauth import get_system_oauth_token
 from open_webui.utils.payload import apply_params_to_form_data, apply_system_prompt_to_body
@@ -6542,6 +6543,10 @@ async def streaming_chat_response_handler(response, ctx):
                                 # (e.g. session disconnected, timeout)
                                 if isinstance(ci_output, dict) and ci_output.get('error'):
                                     ci_output = {'stderr': ci_output['error']}
+
+                                # Fork: files the run wrote to /mnt/uploads, uploaded by the page.
+                                if ci_engine == 'pyodide':
+                                    await attach_code_interpreter_files(ci_output, user.id, event_emitter)
 
                                 if isinstance(ci_output, dict):
                                     stdout = ci_output.get('stdout', '')

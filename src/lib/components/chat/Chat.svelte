@@ -2034,9 +2034,19 @@
 				} else if (type === 'chat:message:voice') {
 					message.meta = { ...message.meta, voice: data.voice };
 				} else if (type === 'chat:message:files' || type === 'files') {
-					message.files = isTemporaryChatId(event.chat_id)
-						? [...(message.files ?? []), ...data.files]
-						: data.files;
+					// Fork: the server adds 'files' to the message's files (it keeps the earlier ones), so
+					// merge here too; otherwise a second code run in one reply hides the first one's files.
+					const merged = [...(message.files ?? []), ...(data.files ?? [])];
+					message.files =
+						isTemporaryChatId(event.chat_id) || type === 'files'
+							? merged.filter(
+									(file, idx) =>
+										!(file?.id || file?.url) ||
+										merged.findIndex(
+											(other) => (other?.id || other?.url) === (file?.id || file?.url)
+										) === idx
+								)
+							: data.files;
 				} else if (type === 'chat:message:tasks') {
 					chatTasks = data.tasks;
 				} else if (type === 'chat:message:embeds' || type === 'embeds') {

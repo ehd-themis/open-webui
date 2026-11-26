@@ -54,6 +54,11 @@ const sandboxScript = String.raw`
 		}
 	}
 
+	function mtimeOf(stat) {
+		const value = stat && stat.mtime;
+		return value instanceof Date ? value.getTime() : Number(value) || 0;
+	}
+
 	function list(path) {
 		const entries = [];
 		try {
@@ -64,7 +69,7 @@ const sandboxScript = String.raw`
 				try {
 					const stat = pyodide.FS.stat(path + '/' + name);
 					const isDir = pyodide.FS.isDir(stat.mode);
-					entries.push({ name: name, type: isDir ? 'directory' : 'file', size: isDir ? 0 : stat.size });
+					entries.push({ name: name, type: isDir ? 'directory' : 'file', size: isDir ? 0 : stat.size, mtime: mtimeOf(stat) });
 				} catch {}
 			}
 		} catch {}
